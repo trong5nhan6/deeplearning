@@ -89,11 +89,9 @@ def setup_logger(name: str, log_file: Optional[str] = None, level=logging.INFO) 
     logger = logging.getLogger(name)
     logger.setLevel(level)
     logger.handlers.clear()
+    logger.propagate = False  # prevent duplicate output in Jupyter/Colab
 
-    fmt = logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    fmt = logging.Formatter("%(asctime)s | %(message)s", datefmt="%H:%M:%S")
 
     sh = logging.StreamHandler()
     sh.setFormatter(fmt)
@@ -102,7 +100,9 @@ def setup_logger(name: str, log_file: Optional[str] = None, level=logging.INFO) 
     if log_file:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         fh = logging.FileHandler(log_file)
-        fh.setFormatter(fmt)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+        ))
         logger.addHandler(fh)
 
     return logger

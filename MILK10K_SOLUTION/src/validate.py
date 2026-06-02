@@ -51,7 +51,7 @@ def validate_epoch(
         labels = labels.to(device, non_blocking=True)
 
         # ── Forward ──────────────────────────────────────────────────────────
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast("cuda", enabled=use_amp):
             logits = _forward(model, batch, device)
             loss   = criterion(logits, labels)
 
@@ -67,7 +67,7 @@ def validate_epoch(
     logits_np, labels_np = concat_outputs(all_logits, all_labels)
     metrics = compute_metrics(logits_np, labels_np, threshold=threshold)
 
-    return loss_meter.avg, metrics["macro_f1"], metrics["per_class_f1"]
+    return loss_meter.avg, metrics["macro_f1"], metrics["per_class_f1"], metrics["accuracy"]
 
 
 def _forward(model: nn.Module, batch: Dict, device: torch.device) -> torch.Tensor:

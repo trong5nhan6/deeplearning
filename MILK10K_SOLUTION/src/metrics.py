@@ -60,6 +60,16 @@ def per_class_f1(
     return {n: float(s) for n, s in zip(names, scores)}
 
 
+def binary_accuracy(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    threshold: float = 0.5,
+) -> float:
+    """Element-wise binary accuracy across all samples and label columns."""
+    y_bin = binarize(y_pred, threshold)
+    return float((y_bin == y_true.astype(int)).mean())
+
+
 def compute_metrics(
     logits: np.ndarray,
     labels: np.ndarray,
@@ -69,14 +79,16 @@ def compute_metrics(
     """
     Full metric computation from raw model logits.
     Applies sigmoid internally.
-    Returns dict with macro_f1 and per_class_f1.
+    Returns dict with macro_f1, per_class_f1, and accuracy.
     """
-    probs  = sigmoid(logits)
-    m_f1   = macro_f1(labels, probs, threshold)
-    pc_f1  = per_class_f1(labels, probs, threshold, label_names)
+    probs = sigmoid(logits)
+    m_f1  = macro_f1(labels, probs, threshold)
+    pc_f1 = per_class_f1(labels, probs, threshold, label_names)
+    acc   = binary_accuracy(labels, probs, threshold)
     return {
         "macro_f1":     m_f1,
         "per_class_f1": pc_f1,
+        "accuracy":     acc,
         "threshold":    threshold,
     }
 

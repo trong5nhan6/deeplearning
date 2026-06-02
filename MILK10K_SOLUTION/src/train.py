@@ -21,9 +21,11 @@ from src.utils import (
 from src.validate import _forward, validate_epoch
 
 
-def train_epoch(model, loader, criterion, optimizer, scaler, device, clip_grad=1.0, use_amp=True):
+def train_epoch(model, loader, criterion, optimizer, scaler, device, clip_grad=1.0, use_amp=True, threshold=0.5):
     model.train()
     loss_meter = AverageMeter("train_loss")
+    all_logits: list = []
+    all_labels: list = []
     pbar = tqdm(loader, desc="  Train", leave=False, dynamic_ncols=True)
     for batch in pbar:
         labels = batch.get("labels")
@@ -31,7 +33,7 @@ def train_epoch(model, loader, criterion, optimizer, scaler, device, clip_grad=1
             continue
         labels = labels.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast("cuda", enabled=use_amp):
             logits = _forward(model, batch, device)
             loss   = criterion(logits, labels)
         scaler.scale(loss).backward()
@@ -41,8 +43,16 @@ def train_epoch(model, loader, criterion, optimizer, scaler, device, clip_grad=1
         scaler.step(optimizer)
         scaler.update()
         loss_meter.update(loss.item(), n=labels.size(0))
+        all_logits.append(logits.detach().cpu())
+        all_labels.append(labels.detach().cpu())
         pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}"})
-    return loss_meter.avg
+
+    from src.metrics import concat_outputs, compute_metrics
+    logits_np, labels_np = concat_outputs(all_logits, all_labels)
+    metrics   = compute_metrics(logits_np, labels_np, threshold=threshold)
+    train_acc = float(metrics.get("accuracy", 0.0))
+    train_f1  = float(metrics.get("macro_f1", 0.0))
+    return loss_meter.avg, train_acc, train_f1
 
 
 def _build_datasets(cfg):
@@ -147,12 +157,12 @@ def train(cfg, model):
     )
 
     use_amp = cfg.get("use_amp", True) and torch.cuda.is_available()
-    scaler  = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler  = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     early_stop = EarlyStopping(patience=cfg.get("early_stopping_patience", 10), mode="max")
     csv_log = CSVLogger(
         path=str(log_dir / f"{model_name}_train_log.csv"),
-        fieldnames=["epoch","train_loss","val_loss","macro_f1","lr"]
+        fieldnames=["epoch","train_loss","train_acc","train_f1","val_loss","val_acc","macro_f1","lr"]
                    + [f"f1_{c}" for c in LABEL_COLS],
     )
 
@@ -162,14 +172,15 @@ def train(cfg, model):
     clip_grad = cfg.get("clip_grad", 1.0)
     threshold = cfg.get("threshold", 0.5)
 
-    logger.info(f"Starting training for {epochs} epochs ...")
+    logger.info(f"Training {model_name}  epochs={epochs}  bs={cfg.get('batch_size',32)}  lr={cfg.get('lr',1e-4):.1e}")
+    logger.info(f"{'Epoch':>10}  {'Loss tr/val':>14}  {'Acc tr/val':>12}  {'F1 tr/val':>12}  LR")
 
     for epoch in range(1, epochs + 1):
-        train_loss = train_epoch(
+        train_loss, train_acc, train_f1 = train_epoch(
             model, train_loader, criterion, optimizer,
-            scaler, device, clip_grad, use_amp,
+            scaler, device, clip_grad, use_amp, threshold,
         )
-        val_loss, mf1, pc_f1 = validate_epoch(
+        val_loss, mf1, pc_f1, val_acc = validate_epoch(
             model, val_loader, criterion, device,
             threshold=threshold, use_amp=use_amp,
         )
@@ -181,24 +192,36 @@ def train(cfg, model):
         else:
             scheduler.step()
 
-        per_cls_str = " | ".join(f"{k}={v:.3f}" for k, v in pc_f1.items())
+        is_best = mf1 > best_f1
+        best_tag = " [BEST]" if is_best else ""
+
+        # Compact per-class F1 — two chars abbrev
+        cls_str = "  ".join(f"{k[:4]}={v:.2f}" for k, v in pc_f1.items())
+
         logger.info(
-            f"Epoch {epoch:03d}/{epochs} | "
-            f"train={train_loss:.4f} | val={val_loss:.4f} | "
-            f"macro_f1={mf1:.4f} | lr={current_lr:.2e} | {timer.elapsed()}"
+            f"[{epoch:03d}/{epochs}]"
+            f"  Loss {train_loss:.4f}/{val_loss:.4f}"
+            f"  Acc {train_acc:.4f}/{val_acc:.4f}"
+            f"  F1 {train_f1:.4f}/{mf1:.4f}"
+            f"  lr={current_lr:.1e}"
+            f"  {timer.elapsed()}"
+            f"{best_tag}"
         )
-        logger.info(f"  {per_cls_str}")
+        logger.info(f"         {cls_str}")
 
         csv_log.log({
-            "epoch": epoch,
+            "epoch":      epoch,
             "train_loss": round(train_loss, 6),
+            "train_acc":  round(train_acc,  6),
+            "train_f1":   round(train_f1,   6),
             "val_loss":   round(val_loss,   6),
+            "val_acc":    round(val_acc,    6),
             "macro_f1":   round(mf1,        6),
             "lr":         round(current_lr, 10),
             **{f"f1_{c}": round(pc_f1.get(c, 0.0), 6) for c in LABEL_COLS},
         })
 
-        if mf1 > best_f1:
+        if is_best:
             best_f1 = mf1
             save_checkpoint(
                 {"epoch": epoch, "model_state_dict": model.state_dict(),
@@ -206,7 +229,6 @@ def train(cfg, model):
                  "best_macro_f1": best_f1, "cfg": cfg},
                 checkpoint_dir=str(ckpt_dir), filename="best.pth",
             )
-            logger.info(f"  New best macro_f1={best_f1:.4f} -> saved best.pth")
 
         save_checkpoint(
             {"epoch": epoch, "model_state_dict": model.state_dict(),
@@ -219,5 +241,5 @@ def train(cfg, model):
             logger.info(f"Early stopping at epoch {epoch}")
             break
 
-    logger.info(f"Done. Best macro_f1={best_f1:.4f} | Time: {timer.elapsed()}")
+    logger.info(f"Done  best_val_f1={best_f1:.4f}  total_time={timer.elapsed()}")
     return best_f1
