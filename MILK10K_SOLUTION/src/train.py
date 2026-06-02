@@ -18,10 +18,69 @@ from src.utils import (
     get_device, get_optimizer, get_scheduler,
     save_checkpoint, set_seed, setup_logger,
 )
-from src.validate import _forward, validate_epoch
+from src.validate import _forward, collect_outputs, validate_epoch
 
 
-def train_epoch(model, loader, criterion, optimizer, scaler, device, clip_grad=1.0, use_amp=True, threshold=0.5):
+def _log_final_summary(model, val_loader, device, threshold, use_amp, logger, cfg, ckpt_dir):
+    """Load best weights, run final val pass, log comprehensive metrics and model info."""
+    from src.metrics import compute_full_summary
+    from src.utils import load_checkpoint
+
+    best_path = Path(ckpt_dir) / "best.pth"
+    if best_path.exists():
+        load_checkpoint(str(best_path), model, device=str(device))
+        logger.info(f"Loaded best weights: {best_path}")
+    else:
+        logger.warning(f"best.pth not found at {best_path} — summary uses last-epoch weights")
+
+    all_logits, all_labels = collect_outputs(model, val_loader, device, use_amp=use_amp)
+    logits_np, labels_np   = concat_outputs(all_logits, all_labels)
+    s = compute_full_summary(logits_np, labels_np, threshold=threshold)
+
+    logger.info("=" * 50)
+    logger.info("===== FINAL VALIDATION SUMMARY (best checkpoint) =====")
+    logger.info(f"  Acc@1      : {s['acc1']:.4f}")
+    logger.info(f"  Acc@5      : {s['acc5']:.4f}")
+    logger.info(f"  Precision  : {s['precision']:.4f}")
+    logger.info(f"  Recall     : {s['recall']:.4f}")
+    logger.info(f"  Macro F1   : {s['macro_f1']:.4f}")
+    logger.info(f"  ROC-AUC    : {s['roc_auc']:.4f}")
+    logger.info("===== MODEL INFO =====")
+    logger.info(f"  Model      : {cfg.get('model_name', '?')}")
+
+    params_m = sum(p.numel() for p in model.parameters()) / 1e6
+    img_size = cfg.get("image_size", 224)
+    gflops   = None
+    try:
+        from torchinfo import summary as _ti_summary
+        ti = _ti_summary(
+            model, input_size=(1, 3, img_size, img_size),
+            verbose=0, device=str(device),
+        )
+        gflops = ti.total_mult_adds / 1e9
+    except Exception:
+        pass
+
+    if gflops is not None:
+        logger.info(f"  GFLOPs     : {gflops:.2f}")
+    logger.info(f"  Params (M) : {params_m:.2f}")
+    logger.info("=" * 50)
+
+
+def _apply_mixup(batch, labels, alpha, device):
+    """Mix images within a batch for MixUp augmentation."""
+    lam = float(np.random.beta(alpha, alpha))
+    idx = torch.randperm(labels.size(0), device=device)
+    labels_b = labels[idx]
+    for key in ("image", "derm_image", "clinical_image"):
+        if key in batch:
+            img = batch[key].to(device, non_blocking=True)
+            batch[key] = lam * img + (1 - lam) * img[idx]
+    return batch, labels_b, lam
+
+
+def train_epoch(model, loader, criterion, optimizer, scaler, device,
+                clip_grad=1.0, use_amp=True, threshold=0.5, mixup_alpha=0.0):
     model.train()
     loss_meter = AverageMeter("train_loss")
     all_logits: list = []
@@ -32,10 +91,18 @@ def train_epoch(model, loader, criterion, optimizer, scaler, device, clip_grad=1
         if labels is None:
             continue
         labels = labels.to(device, non_blocking=True)
+
+        labels_b, lam = None, 1.0
+        if mixup_alpha > 0:
+            batch, labels_b, lam = _apply_mixup(batch, labels, mixup_alpha, device)
+
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", enabled=use_amp):
             logits = _forward(model, batch, device)
-            loss   = criterion(logits, labels)
+            if labels_b is not None:
+                loss = lam * criterion(logits, labels) + (1 - lam) * criterion(logits, labels_b)
+            else:
+                loss = criterion(logits, labels)
         scaler.scale(loss).backward()
         if clip_grad > 0:
             scaler.unscale_(optimizer)
@@ -47,7 +114,6 @@ def train_epoch(model, loader, criterion, optimizer, scaler, device, clip_grad=1
         all_labels.append(labels.detach().cpu())
         pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}"})
 
-    from src.metrics import concat_outputs, compute_metrics
     logits_np, labels_np = concat_outputs(all_logits, all_labels)
     metrics   = compute_metrics(logits_np, labels_np, threshold=threshold)
     train_acc = float(metrics.get("accuracy", 0.0))
@@ -110,7 +176,7 @@ def train(cfg, model):
 
     model_name = cfg.get("model_name", "model")
     ckpt_dir   = Path(cfg.get("checkpoint_dir", "outputs/checkpoints")) / model_name
-    log_dir    = Path(cfg.get("output_dir",    "outputs/logs"))
+    log_dir    = Path(cfg.get("output_dir",    "outputs/logs")) / model_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -147,6 +213,7 @@ def train(cfg, model):
     optimizer = get_optimizer(
         model, cfg.get("optimizer", "adamw"),
         lr=cfg.get("lr", 1e-4), weight_decay=cfg.get("weight_decay", 1e-4),
+        layer_lr_decay=cfg.get("layer_lr_decay", 1.0),
     )
     scheduler = get_scheduler(
         optimizer, cfg.get("scheduler", "cosine"),
@@ -179,13 +246,14 @@ def train(cfg, model):
         train_loss, train_acc, train_f1 = train_epoch(
             model, train_loader, criterion, optimizer,
             scaler, device, clip_grad, use_amp, threshold,
+            mixup_alpha=cfg.get("mixup_alpha", 0.0),
         )
         val_loss, mf1, pc_f1, val_acc = validate_epoch(
             model, val_loader, criterion, device,
             threshold=threshold, use_amp=use_amp,
         )
 
-        current_lr = optimizer.param_groups[0]["lr"]
+        current_lr = optimizer.param_groups[-1]["lr"]  # head LR (last group)
         sched_name = cfg.get("scheduler", "cosine").lower()
         if sched_name == "plateau":
             scheduler.step(mf1)
@@ -241,5 +309,6 @@ def train(cfg, model):
             logger.info(f"Early stopping at epoch {epoch}")
             break
 
+    _log_final_summary(model, val_loader, device, threshold, use_amp, logger, cfg, str(ckpt_dir))
     logger.info(f"Done  best_val_f1={best_f1:.4f}  total_time={timer.elapsed()}")
     return best_f1

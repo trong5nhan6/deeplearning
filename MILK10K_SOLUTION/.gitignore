@@ -1,0 +1,33 @@
+# Model weights
+*.pth
+*.pt
+*.ckpt
+outputs/checkpoints/
+
+# Dataset (large files — download separately)
+datasets/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Env / IDE
+.env
+.venv
+venv/
+.idea/
+.vscode/
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db

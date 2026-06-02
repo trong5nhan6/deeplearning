@@ -23,7 +23,7 @@ def run_inference(model, loader, device, use_amp=True):
     pbar = tqdm(loader, desc="  Infer", leave=False, dynamic_ncols=True)
     for batch in pbar:
         all_lesions.extend(batch["lesion"])
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast("cuda", enabled=use_amp):
             if "clinical_image" in batch and "derm_image" in batch:
                 clin = batch["clinical_image"].to(device, non_blocking=True)
                 derm = batch["derm_image"].to(device, non_blocking=True)

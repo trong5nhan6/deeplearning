@@ -70,6 +70,29 @@ def validate_epoch(
     return loss_meter.avg, metrics["macro_f1"], metrics["per_class_f1"], metrics["accuracy"]
 
 
+@torch.no_grad()
+def collect_outputs(
+    model:   nn.Module,
+    loader:  DataLoader,
+    device:  torch.device,
+    use_amp: bool = True,
+):
+    """Collect all logits and labels from a dataloader (no loss computed)."""
+    model.eval()
+    all_logits: list = []
+    all_labels: list = []
+    for batch in loader:
+        labels = batch.get("labels")
+        if labels is None:
+            continue
+        labels = labels.to(device, non_blocking=True)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            logits = _forward(model, batch, device)
+        all_logits.append(logits.detach().cpu())
+        all_labels.append(labels.detach().cpu())
+    return all_logits, all_labels
+
+
 def _forward(model: nn.Module, batch: Dict, device: torch.device) -> torch.Tensor:
     """Route batch to model depending on mode (single vs dual image)."""
     if "clinical_image" in batch and "derm_image" in batch:

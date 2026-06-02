@@ -263,11 +263,40 @@ def get_optimizer(
     optimizer_name: str,
     lr: float,
     weight_decay: float = 1e-4,
+    layer_lr_decay: float = 1.0,
     **kwargs,
 ) -> torch.optim.Optimizer:
-    """Factory for optimizers."""
+    """Factory for optimizers. When layer_lr_decay < 1, backbone gets lr*decay, head gets lr."""
     optimizer_name = optimizer_name.lower()
-    params         = model.parameters()
+
+    if layer_lr_decay < 1.0:
+        # Collect backbone parameters, handling both SwinModel (.backbone) and
+        # DualBranchModel (.clinical_branch / .derm_branch, may share weights).
+        if hasattr(model, "backbone"):
+            trunk_params = list(model.backbone.parameters())
+        elif hasattr(model, "clinical_branch"):
+            seen: set = set()
+            trunk_params = []
+            for branch in (model.clinical_branch, model.derm_branch):
+                for p in branch.parameters():
+                    if id(p) not in seen:
+                        seen.add(id(p))
+                        trunk_params.append(p)
+        else:
+            trunk_params = []
+
+        if trunk_params:
+            backbone_ids = {id(p) for p in trunk_params}
+            params = [
+                {"params": [p for p in model.parameters() if id(p) in backbone_ids],
+                 "lr": lr * layer_lr_decay},
+                {"params": [p for p in model.parameters() if id(p) not in backbone_ids],
+                 "lr": lr},
+            ]
+        else:
+            params = model.parameters()  # type: ignore[assignment]
+    else:
+        params = model.parameters()  # type: ignore[assignment]
 
     if optimizer_name == "adam":
         return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)

@@ -70,6 +70,53 @@ def binary_accuracy(
     return float((y_bin == y_true.astype(int)).mean())
 
 
+def _top_k_accuracy(logits: np.ndarray, labels: np.ndarray, k: int) -> float:
+    """Fraction of samples that have ≥1 true-positive label in the top-k predictions.
+    Samples with no positive label are excluded from the denominator."""
+    top_k_idx = np.argsort(logits, axis=1)[:, -k:]
+    valid, correct = 0, 0
+    for i in range(logits.shape[0]):
+        true_pos = np.where(labels[i] == 1)[0]
+        if len(true_pos) == 0:
+            continue
+        valid += 1
+        if np.any(np.isin(true_pos, top_k_idx[i])):
+            correct += 1
+    return correct / valid if valid > 0 else 0.0
+
+
+def compute_full_summary(
+    logits: np.ndarray,
+    labels: np.ndarray,
+    threshold: float = 0.5,
+) -> Dict:
+    """Extended metrics for end-of-training summary: Acc@k, Precision, Recall, F1, ROC-AUC."""
+    from sklearn.metrics import precision_score, recall_score, roc_auc_score
+
+    probs = sigmoid(logits)
+    preds = binarize(probs, threshold)
+
+    acc1      = _top_k_accuracy(logits, labels, k=1)
+    acc5      = _top_k_accuracy(logits, labels, k=5)
+    precision = float(precision_score(labels, preds, average="macro", zero_division=0))
+    recall    = float(recall_score(labels, preds, average="macro", zero_division=0))
+    f1        = float(f1_score(labels, preds, average="macro", zero_division=0))
+
+    try:
+        roc_auc = float(roc_auc_score(labels, probs, average="macro"))
+    except ValueError:
+        roc_auc = 0.0
+
+    return {
+        "acc1":      acc1,
+        "acc5":      acc5,
+        "precision": precision,
+        "recall":    recall,
+        "macro_f1":  f1,
+        "roc_auc":   roc_auc,
+    }
+
+
 def compute_metrics(
     logits: np.ndarray,
     labels: np.ndarray,
