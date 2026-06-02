@@ -183,8 +183,8 @@ def _save_splits(train_df: pd.DataFrame, val_df: pd.DataFrame, out_dir: Path, fo
     val_path   = out_dir / f"val_fold{fold}.csv"
     train_df.to_csv(train_path, index=False)
     val_df.to_csv(val_path,   index=False)
-    print(f"Saved → {train_path}")
-    print(f"Saved → {val_path}")
+    print(f"Saved: {train_path}")
+    print(f"Saved: {val_path}")
 
 
 def _print_class_distribution(
@@ -192,7 +192,7 @@ def _print_class_distribution(
     val_df: pd.DataFrame,
     label_cols: List[str],
 ):
-    print("\n── Class Distribution ───────────────────────────────────")
+    print("\n-- Class Distribution ----------------------------------")
     print(f"{'Class':<12} {'Train':>8} {'Val':>6} {'Train%':>8} {'Val%':>6}")
     print("-" * 46)
     for col in label_cols:
@@ -201,7 +201,7 @@ def _print_class_distribution(
         tr_p = 100 * tr_n / max(len(train_df), 1)
         vl_p = 100 * vl_n / max(len(val_df),   1)
         print(f"{col:<12} {tr_n:>8} {vl_n:>6} {tr_p:>7.1f}% {vl_p:>5.1f}%")
-    print("─" * 46)
+    print("-" * 46)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
