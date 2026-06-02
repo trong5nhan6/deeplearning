@@ -2,7 +2,7 @@
 submission.py — Build and validate the ISIC MILK10k submission CSV.
 
 Expected format:
-    lesion, AKIEC, BCC, BEN_OTH, BKL, DF, INF, MAL_OTH, MEL, NV, SCCKA, VASC
+    lesion_id, AKIEC, BCC, BEN_OTH, BKL, DF, INF, MAL_OTH, MEL, NV, SCCKA, VASC
 Values must be float in [0, 1].
 """
 
@@ -18,7 +18,7 @@ import pandas as pd
 LABEL_COLS = ["AKIEC", "BCC", "BEN_OTH", "BKL", "DF", "INF",
               "MAL_OTH", "MEL", "NV", "SCCKA", "VASC"]
 
-SUBMISSION_COLS = ["lesion"] + LABEL_COLS
+SUBMISSION_COLS = ["lesion_id"] + LABEL_COLS
 
 
 def build_submission(
@@ -50,7 +50,7 @@ def build_submission(
     probs = np.clip(probs, 0.0, 1.0)
 
     df = pd.DataFrame(probs, columns=label_cols)
-    df.insert(0, "lesion", lesion_ids)
+    df.insert(0, "lesion_id", lesion_ids)
 
     # Ensure column order matches official format
     df = df[SUBMISSION_COLS]
@@ -85,7 +85,7 @@ def _validate_submission(df: pd.DataFrame):
         raise ValueError("Submission contains NaN values.")
 
     # Duplicate lesion IDs
-    dupes = df["lesion"].duplicated().sum()
+    dupes = df["lesion_id"].duplicated().sum()
     if dupes > 0:
         raise ValueError(f"Submission has {dupes} duplicate lesion IDs.")
 
@@ -122,9 +122,9 @@ def ensemble_submissions(
     dfs = [pd.read_csv(p) for p in paths]
 
     # Verify lesion order is consistent
-    ref_lesions = dfs[0]["lesion"].values
+    ref_lesions = dfs[0]["lesion_id"].values
     for i, d in enumerate(dfs[1:], start=1):
-        if not np.array_equal(d["lesion"].values, ref_lesions):
+        if not np.array_equal(d["lesion_id"].values, ref_lesions):
             raise ValueError(
                 f"Submission {paths[i]} has different lesion order than {paths[0]}."
                 " Sort submissions before ensembling."
@@ -135,7 +135,7 @@ def ensemble_submissions(
         ensemble_probs += w * df[LABEL_COLS].values
 
     result_df = pd.DataFrame(ensemble_probs, columns=LABEL_COLS)
-    result_df.insert(0, "lesion", ref_lesions)
+    result_df.insert(0, "lesion_id", ref_lesions)
     result_df = result_df[SUBMISSION_COLS]
     _validate_submission(result_df)
 
