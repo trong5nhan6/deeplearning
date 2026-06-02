@@ -1,0 +1,71 @@
+# ── Model ─────────────────────────────────────────────────────────────────────
+model_name:      "convnext_base"
+pretrained:      true
+num_classes:     11
+drop_rate:       0.0
+drop_path_rate:  0.1
+
+# ── Input mode ─────────────────────────────────────────────────────────────────
+mode:       "single_image"
+image_type: "dermoscopy"
+image_size: 224
+
+# ── Metadata ───────────────────────────────────────────────────────────────────
+use_metadata: false
+
+# ── Column names ───────────────────────────────────────────────────────────────
+lesion_col:   "lesion_id"
+clinical_col: "clinical_path"
+derm_col:     "derm_path"
+
+# ── Dual-branch ────────────────────────────────────────────────────────────────
+dual_shared_weights: true
+
+# ── Data paths ─────────────────────────────────────────────────────────────────
+train_csv: "datasets/MILK10k/splits/train_fold0.csv"
+val_csv:   "datasets/MILK10k/splits/val_fold0.csv"
+test_csv:  "datasets/MILK10k/test/test_combined.csv"
+image_dir: "datasets/MILK10k/train/MILK10k_Training_Input"
+train_image_dir: "datasets/MILK10k/train/MILK10k_Training_Input"
+test_image_dir:  "datasets/MILK10k/test/MILK10k_Test_Input"
+
+# ── Training ───────────────────────────────────────────────────────────────────
+epochs:      30
+batch_size:  32
+num_workers: 4
+seed:        42
+
+# ── Optimizer ──────────────────────────────────────────────────────────────────
+optimizer:    "adamw"
+lr:           5.0e-5
+weight_decay: 1.0e-4
+
+# ── Scheduler ──────────────────────────────────────────────────────────────────
+scheduler:     "cosine"
+warmup_epochs: 3
+eta_min:       1.0e-7
+
+# ── AMP & gradient ─────────────────────────────────────────────────────────────
+use_amp:   true
+clip_grad: 1.0
+
+# ── Loss ───────────────────────────────────────────────────────────────────────
+loss_name:      "asl"     # Asymmetric Loss — best for multi-label
+use_pos_weight: false
+asl_gamma_neg:  4.0
+asl_gamma_pos:  0.0
+asl_clip:       0.05
+
+# ── Sampler ────────────────────────────────────────────────────────────────────
+use_weighted_sampler: false
+
+# ── Early stopping ─────────────────────────────────────────────────────────────
+early_stopping_patience: 10
+
+# ── Threshold ──────────────────────────────────────────────────────────────────
+threshold: 0.5
+
+# ── Output ─────────────────────────────────────────────────────────────────────
+checkpoint_dir: "outputs/checkpoints"
+output_dir:     "outputs/logs"
+submission_dir: "outputs/submissions"

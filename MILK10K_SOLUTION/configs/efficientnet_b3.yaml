@@ -1,0 +1,70 @@
+# ── Model ─────────────────────────────────────────────────────────────────────
+model_name:      "efficientnet_b3"
+pretrained:      true
+num_classes:     11
+drop_rate:       0.3
+drop_path_rate:  0.2
+
+# ── Input mode ─────────────────────────────────────────────────────────────────
+mode:       "single_image"
+image_type: "dermoscopy"
+image_size: 300
+
+# ── Metadata ───────────────────────────────────────────────────────────────────
+use_metadata: false
+
+# ── Column names ───────────────────────────────────────────────────────────────
+lesion_col:   "lesion_id"
+clinical_col: "clinical_path"
+derm_col:     "derm_path"
+
+# ── Dual-branch ────────────────────────────────────────────────────────────────
+dual_shared_weights: true
+
+# ── Data paths ─────────────────────────────────────────────────────────────────
+train_csv: "datasets/MILK10k/splits/train_fold0.csv"
+val_csv:   "datasets/MILK10k/splits/val_fold0.csv"
+test_csv:  "datasets/MILK10k/test/test_combined.csv"
+image_dir: "datasets/MILK10k/train/MILK10k_Training_Input"
+train_image_dir: "datasets/MILK10k/train/MILK10k_Training_Input"
+test_image_dir:  "datasets/MILK10k/test/MILK10k_Test_Input"
+
+# ── Training ───────────────────────────────────────────────────────────────────
+epochs:      40
+batch_size:  24
+num_workers: 4
+seed:        42
+
+# ── Optimizer ──────────────────────────────────────────────────────────────────
+optimizer:    "adamw"
+lr:           3.0e-4
+weight_decay: 1.0e-4
+
+# ── Scheduler ──────────────────────────────────────────────────────────────────
+scheduler:     "cosine"
+warmup_epochs: 2
+eta_min:       1.0e-7
+
+# ── AMP & gradient ─────────────────────────────────────────────────────────────
+use_amp:   true
+clip_grad: 1.0
+
+# ── Loss ───────────────────────────────────────────────────────────────────────
+loss_name:      "focal"
+use_pos_weight: false
+focal_alpha:    0.25
+focal_gamma:    2.0
+
+# ── Sampler ────────────────────────────────────────────────────────────────────
+use_weighted_sampler: true
+
+# ── Early stopping ─────────────────────────────────────────────────────────────
+early_stopping_patience: 12
+
+# ── Threshold ──────────────────────────────────────────────────────────────────
+threshold: 0.5
+
+# ── Output ─────────────────────────────────────────────────────────────────────
+checkpoint_dir: "outputs/checkpoints"
+output_dir:     "outputs/logs"
+submission_dir: "outputs/submissions"
