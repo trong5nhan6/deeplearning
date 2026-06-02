@@ -10,14 +10,42 @@ from albumentations.pytorch import ToTensorV2
 
 def get_train_transforms(image_size: int = 224) -> A.Compose:
     """Heavy augmentation for training."""
-    return A.Compose([
-        A.RandomResizedCrop(
-            height=image_size,
-            width=image_size,
+    import albumentations as _A
+    _ver = tuple(int(x) for x in _A.__version__.split(".")[:2])
+    _new_api = _ver >= (1, 4)
+
+    if _new_api:
+        crop = A.RandomResizedCrop(
+            size=(image_size, image_size),
             scale=(0.7, 1.0),
             ratio=(0.75, 1.333),
             p=1.0,
-        ),
+        )
+        dropout = A.CoarseDropout(
+            num_holes_range=(1, 8),
+            hole_height_range=(image_size // 16, image_size // 8),
+            hole_width_range=(image_size // 16, image_size // 8),
+            fill=0,
+            p=0.3,
+        )
+        noise = A.GaussNoise(p=1.0)
+    else:
+        crop = A.RandomResizedCrop(
+            height=image_size, width=image_size,
+            scale=(0.7, 1.0), ratio=(0.75, 1.333), p=1.0,
+        )
+        dropout = A.CoarseDropout(
+            max_holes=8,
+            max_height=image_size // 8,
+            max_width=image_size // 8,
+            min_holes=1,
+            fill_value=0,
+            p=0.3,
+        )
+        noise = A.GaussNoise(var_limit=(10.0, 50.0), p=1.0)
+
+    return A.Compose([
+        crop,
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.Rotate(limit=30, p=0.5),
@@ -36,7 +64,7 @@ def get_train_transforms(image_size: int = 224) -> A.Compose:
             ),
         ], p=0.5),
         A.OneOf([
-            A.GaussNoise(var_limit=(10.0, 50.0), p=1.0),
+            noise,
             A.GaussianBlur(blur_limit=(3, 5), p=1.0),
             A.MotionBlur(blur_limit=5, p=1.0),
         ], p=0.3),
@@ -47,14 +75,7 @@ def get_train_transforms(image_size: int = 224) -> A.Compose:
             border_mode=0,
             p=0.4,
         ),
-        A.CoarseDropout(
-            max_holes=8,
-            max_height=image_size // 8,
-            max_width=image_size // 8,
-            min_holes=1,
-            fill_value=0,
-            p=0.3,
-        ),
+        dropout,
         A.Normalize(
             mean=(0.485, 0.456, 0.406),
             std=(0.229, 0.224, 0.225),
@@ -65,8 +86,11 @@ def get_train_transforms(image_size: int = 224) -> A.Compose:
 
 def get_val_transforms(image_size: int = 224) -> A.Compose:
     """Minimal deterministic transform for validation and test."""
+    import albumentations as _A
+    _ver = tuple(int(x) for x in _A.__version__.split(".")[:2])
+    resize = A.Resize(image_size, image_size) if _ver >= (1, 4) else A.Resize(height=image_size, width=image_size)
     return A.Compose([
-        A.Resize(height=image_size, width=image_size),
+        resize,
         A.Normalize(
             mean=(0.485, 0.456, 0.406),
             std=(0.229, 0.224, 0.225),
@@ -80,11 +104,13 @@ def get_tta_transforms(image_size: int = 224) -> list[A.Compose]:
     Test-Time Augmentation (TTA) variants.
     Returns a list of transforms; run inference with each and average probabilities.
     """
+    import albumentations as _A
+    _ver = tuple(int(x) for x in _A.__version__.split(".")[:2])
     base = A.Normalize(
         mean=(0.485, 0.456, 0.406),
         std=(0.229, 0.224, 0.225),
     )
-    resize = A.Resize(height=image_size, width=image_size)
+    resize = A.Resize(image_size, image_size) if _ver >= (1, 4) else A.Resize(height=image_size, width=image_size)
 
     variants = [
         # Original
