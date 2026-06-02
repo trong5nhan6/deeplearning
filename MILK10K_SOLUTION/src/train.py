@@ -131,7 +131,8 @@ def train(cfg, model):
             pos_weight = compute_pos_weight(labels_np).to(device)
             logger.info(f"  pos_weight: {[round(x,2) for x in pos_weight.tolist()]}")
 
-    criterion = get_loss(cfg.get("loss_name", "bce"), pos_weight=pos_weight, **cfg).to(device)
+    loss_kwargs = {k: v for k, v in cfg.items() if k != "loss_name"}
+    criterion = get_loss(cfg.get("loss_name", "bce"), pos_weight=pos_weight, **loss_kwargs).to(device)
 
     optimizer = get_optimizer(
         model, cfg.get("optimizer", "adamw"),
