@@ -85,8 +85,8 @@ def split_fold(
     csv_path: str,
     out_dir: str,
     fold: int = 0,
-    n_folds: int = 5,
-    val_size: float = 0.2,
+    n_folds: int = 10,
+    val_size: float = 0.1,
     seed: int = 42,
     use_kfold: bool = True,
 ):
@@ -211,8 +211,8 @@ def parse_args():
     p.add_argument("--csv",      required=True, help="Path to train_metadata.csv")
     p.add_argument("--out_dir",  required=True, help="Output directory for split CSVs")
     p.add_argument("--fold",     type=int,   default=0,    help="Fold index (0-indexed)")
-    p.add_argument("--n_folds",  type=int,   default=5,    help="Total number of folds")
-    p.add_argument("--val_size", type=float, default=0.2,  help="Val fraction (if no kfold)")
+    p.add_argument("--n_folds",  type=int,   default=10,   help="Total number of folds")
+    p.add_argument("--val_size", type=float, default=0.1,  help="Val fraction (if no kfold)")
     p.add_argument("--seed",     type=int,   default=42,   help="Random seed")
     p.add_argument("--no_kfold", action="store_true",      help="Use simple split instead of KFold")
     return p.parse_args()
