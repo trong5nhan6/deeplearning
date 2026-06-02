@@ -67,6 +67,50 @@ def _log_final_summary(model, val_loader, device, threshold, use_amp, logger, cf
     logger.info("=" * 50)
 
 
+def _auto_submit(model, cfg, device, use_amp, ckpt_dir, meta_processor, logger):
+    """Run inference with best.pth and last.pth, save two submission CSVs."""
+    from src.infer import run_inference
+    from src.submission import build_submission
+    from src.utils import load_checkpoint
+
+    test_csv     = cfg.get("test_csv")
+    test_img_dir = cfg.get("test_image_dir") or cfg.get("image_dir")
+    sub_dir      = Path(cfg.get("submission_dir", "outputs/submissions"))
+    model_name   = cfg.get("model_name", "model")
+
+    if not test_csv or not Path(test_csv).exists():
+        logger.info("test_csv not found — skipping auto submission")
+        return
+
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    test_ds = MILK10kDataset(
+        csv_path=test_csv, image_dir=test_img_dir,
+        transform=get_val_transforms(cfg.get("image_size", 224)),
+        mode=cfg.get("mode", "single_image"),
+        image_type=cfg.get("image_type", "dermoscopy"),
+        is_test=True, meta_processor=meta_processor, cfg=cfg,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=cfg.get("batch_size", 32) * 2,
+        shuffle=False,
+        num_workers=cfg.get("num_workers", 4),
+        pin_memory=True,
+    )
+
+    logger.info("===== AUTO SUBMISSION =====")
+    for tag in ("best", "last"):
+        ckpt_path = Path(ckpt_dir) / f"{tag}.pth"
+        if not ckpt_path.exists():
+            logger.info(f"  {tag}.pth not found — skipped")
+            continue
+        load_checkpoint(str(ckpt_path), model, device=str(device))
+        lesion_ids, probs = run_inference(model, test_loader, device, use_amp=use_amp)
+        out_path = str(sub_dir / f"submission_{model_name}_{tag}.csv")
+        build_submission(lesion_ids, probs, out_path)
+        logger.info(f"  [{tag}] saved: {out_path}")
+
+
 def _apply_mixup(batch, labels, alpha, device):
     """Mix images within a batch for MixUp augmentation."""
     lam = float(np.random.beta(alpha, alpha))
@@ -310,5 +354,6 @@ def train(cfg, model):
             break
 
     _log_final_summary(model, val_loader, device, threshold, use_amp, logger, cfg, str(ckpt_dir))
+    _auto_submit(model, cfg, device, use_amp, str(ckpt_dir), meta_processor, logger)
     logger.info(f"Done  best_val_f1={best_f1:.4f}  total_time={timer.elapsed()}")
     return best_f1
