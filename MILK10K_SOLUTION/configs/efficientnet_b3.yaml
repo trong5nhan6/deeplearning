@@ -50,10 +50,24 @@ use_amp:   true
 clip_grad: 1.0
 
 # ── Loss ───────────────────────────────────────────────────────────────────────
-loss_name:      "focal"
-use_pos_weight: false
-focal_alpha:    0.25
-focal_gamma:    2.0
+# Available loss functions:
+#   bce            — BCE + sigmoid (multi-label). Pair with use_pos_weight: true
+#   focal          — Sigmoid Focal Loss (multi-label). Params: focal_alpha, focal_gamma
+#   softmax_ce     — CrossEntropy + softmax (single-label). Auto class_weight
+#   focal_softmax  — Focal + softmax (single-label). Params: focal_gamma, label_smoothing
+#   asl            — Asymmetric Loss (multi-label). Params: asl_gamma_neg/pos, asl_clip
+loss_name:       "focal"
+# BCE params (used when loss_name: bce)
+use_pos_weight:  false
+# Focal params (used when loss_name: focal | focal_softmax)
+focal_alpha:     0.25
+focal_gamma:     2.0
+# Softmax CE / Focal-Softmax params
+label_smoothing: 0.0
+# ASL params (used when loss_name: asl)
+asl_gamma_neg:   4.0
+asl_gamma_pos:   0.0
+asl_clip:        0.05
 
 # ── Sampler ────────────────────────────────────────────────────────────────────
 use_weighted_sampler: true

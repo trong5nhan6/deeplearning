@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
 from src.dataset import MILK10kDataset, MetadataProcessor, build_meta_processor
-from src.losses import compute_pos_weight, get_loss
+from src.losses import compute_class_weight, compute_pos_weight, get_loss
 from src.metrics import LABEL_COLS, concat_outputs, compute_metrics
 from src.transforms import get_train_transforms, get_val_transforms
 from src.utils import (
@@ -244,15 +244,25 @@ def train(cfg, model):
         num_workers=num_workers, pin_memory=True,
     )
 
-    pos_weight = None
-    if cfg.get("use_pos_weight", True) and cfg.get("loss_name", "bce").lower() == "bce":
-        if all(c in train_ds.df.columns for c in LABEL_COLS):
-            labels_np  = train_ds.df[LABEL_COLS].values.astype(float)
+    pos_weight   = None
+    class_weight = None
+    loss_name    = cfg.get("loss_name", "bce").lower()
+
+    if all(c in train_ds.df.columns for c in LABEL_COLS):
+        labels_np = train_ds.df[LABEL_COLS].values.astype(float)
+
+        if cfg.get("use_pos_weight", True) and loss_name == "bce":
             pos_weight = compute_pos_weight(labels_np).to(device)
             logger.info(f"  pos_weight: {[round(x,2) for x in pos_weight.tolist()]}")
 
+        if loss_name in ("softmax_ce", "ce", "cross_entropy",
+                         "focal_softmax", "softmax_focal", "ce_focal"):
+            class_weight = compute_class_weight(labels_np).to(device)
+            logger.info(f"  class_weight: {[round(x,2) for x in class_weight.tolist()]}")
+
     loss_kwargs = {k: v for k, v in cfg.items() if k != "loss_name"}
-    criterion = get_loss(cfg.get("loss_name", "bce"), pos_weight=pos_weight, **loss_kwargs).to(device)
+    criterion = get_loss(loss_name, pos_weight=pos_weight,
+                         class_weight=class_weight, **loss_kwargs).to(device)
 
     optimizer = get_optimizer(
         model, cfg.get("optimizer", "adamw"),

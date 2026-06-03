@@ -1,10 +1,11 @@
 """
-losses.py — Loss functions for multi-label classification.
+losses.py — Loss functions for skin lesion classification.
 
 Includes:
   - WeightedBCEWithLogitsLoss  (pos_weight for class imbalance)
-  - FocalLoss
-  - AsymmetricLoss (ASL) — best for multi-label imbalance
+  - FocalLoss                  (sigmoid-based, multi-label)
+  - SoftmaxFocalLoss           (softmax-based, multi-class single-label)
+  - AsymmetricLoss (ASL)       (multi-label imbalance)
 """
 
 from __future__ import annotations
@@ -94,7 +95,100 @@ class FocalLoss(nn.Module):
         return loss
 
 
-# ── 3. Asymmetric Loss (ASL) ─────────────────────────────────────────────────
+# ── 3. Softmax CrossEntropy ──────────────────────────────────────────────────
+
+class SoftmaxCrossEntropyLoss(nn.Module):
+    """
+    Standard CrossEntropy for single-label multi-class classification.
+    Accepts targets as one-hot (N, C) or class indices (N,).
+
+    label_smoothing : label smoothing factor (0.0 = off)
+    weight          : optional per-class weight tensor of shape (C,)
+    """
+
+    def __init__(
+        self,
+        label_smoothing: float = 0.0,
+        weight: Optional[torch.Tensor] = None,
+    ):
+        super().__init__()
+        self.label_smoothing = label_smoothing
+        self.register_buffer("weight", weight)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        if targets.dim() == 2:
+            targets = targets.argmax(dim=1)
+        return F.cross_entropy(
+            logits, targets,
+            weight=self.weight,
+            label_smoothing=self.label_smoothing,
+        )
+
+
+# ── 4. Softmax Focal Loss ────────────────────────────────────────────────────
+
+class SoftmaxFocalLoss(nn.Module):
+    """
+    Focal Loss with Softmax for single-label multi-class classification.
+
+    Uses softmax + CrossEntropy instead of sigmoid + BCE, so class probabilities
+    compete with each other — correct for datasets where each sample has exactly
+    one ground-truth label.
+
+    gamma           : focusing strength (0 = standard CE, 2 is common default)
+    label_smoothing : label smoothing factor (0.0 = off)
+    weight          : optional per-class weight tensor of shape (C,) to handle
+                      class imbalance (computed via compute_class_weight)
+    """
+
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        label_smoothing: float = 0.0,
+        weight: Optional[torch.Tensor] = None,
+    ):
+        super().__init__()
+        self.gamma           = gamma
+        self.label_smoothing = label_smoothing
+        self.register_buffer("weight", weight)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # targets: (N, C) one-hot float → (N,) class indices
+        if targets.dim() == 2:
+            targets_idx = targets.argmax(dim=1)
+        else:
+            targets_idx = targets.long()
+
+        # Per-sample CE loss (no reduction yet)
+        ce = F.cross_entropy(
+            logits, targets_idx,
+            weight=self.weight,
+            label_smoothing=self.label_smoothing,
+            reduction="none",
+        )
+
+        # Focal weight: down-weight easy examples
+        probs = F.softmax(logits, dim=1)
+        p_t   = probs.gather(1, targets_idx.unsqueeze(1)).squeeze(1)
+        focal_w = (1.0 - p_t) ** self.gamma
+
+        return (focal_w * ce).mean()
+
+
+def compute_class_weight(labels: np.ndarray, clip: float = 10.0) -> torch.Tensor:
+    """
+    Inverse-frequency class weights for SoftmaxFocalLoss.
+    labels : (N, C) one-hot numpy array
+    Returns tensor of shape (C,), normalised so mean weight = 1.
+    """
+    counts = labels.sum(axis=0).clip(min=1)
+    w = (1.0 / counts)
+    w = w / w.mean()          # normalise: mean weight = 1
+    w = w.clip(max=clip)
+    return torch.tensor(w, dtype=torch.float32)
+
+
+# ── 5. Asymmetric Loss (ASL) ─────────────────────────────────────────────────
 
 class AsymmetricLoss(nn.Module):
     """
@@ -157,13 +251,15 @@ class AsymmetricLoss(nn.Module):
 def get_loss(
     loss_name: str,
     pos_weight: Optional[torch.Tensor] = None,
+    class_weight: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> nn.Module:
     """
     Factory for loss functions.
 
-    loss_name : 'bce' | 'focal' | 'asl' | 'asymmetric'
-    pos_weight: optional tensor of shape (11,) for BCE
+    loss_name    : 'bce' | 'focal' | 'focal_softmax' | 'asl' | 'asymmetric'
+    pos_weight   : per-class weight tensor (C,) for BCE
+    class_weight : per-class weight tensor (C,) for SoftmaxFocalLoss
     """
     loss_name = loss_name.lower()
 
@@ -175,6 +271,17 @@ def get_loss(
         gamma = kwargs.get("focal_gamma", 2.0)
         return FocalLoss(alpha=alpha, gamma=gamma)
 
+    elif loss_name in ("softmax_ce", "ce", "cross_entropy"):
+        label_smoothing = kwargs.get("label_smoothing", 0.0)
+        return SoftmaxCrossEntropyLoss(label_smoothing=label_smoothing,
+                                       weight=class_weight)
+
+    elif loss_name in ("focal_softmax", "softmax_focal", "ce_focal"):
+        gamma           = kwargs.get("focal_gamma", 2.0)
+        label_smoothing = kwargs.get("label_smoothing", 0.0)
+        return SoftmaxFocalLoss(gamma=gamma, label_smoothing=label_smoothing,
+                                weight=class_weight)
+
     elif loss_name in ("asl", "asymmetric"):
         gamma_neg = kwargs.get("asl_gamma_neg", 4.0)
         gamma_pos = kwargs.get("asl_gamma_pos", 0.0)
@@ -182,4 +289,7 @@ def get_loss(
         return AsymmetricLoss(gamma_neg=gamma_neg, gamma_pos=gamma_pos, clip=clip)
 
     else:
-        raise ValueError(f"Unknown loss: '{loss_name}'. Choose from: bce, focal, asl")
+        raise ValueError(
+            f"Unknown loss: '{loss_name}'. "
+            "Choose from: bce, focal, softmax_ce, focal_softmax, asl"
+        )
