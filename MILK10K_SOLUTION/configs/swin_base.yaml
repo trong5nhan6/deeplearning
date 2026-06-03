@@ -61,7 +61,7 @@ clip_grad: 1.0
 #   softmax_ce     — CrossEntropy + softmax (single-label). Pair with class_weight via auto-compute
 #   focal_softmax  — Focal + softmax (single-label). Params: focal_gamma, label_smoothing
 #   asl            — Asymmetric Loss (multi-label). Params: asl_gamma_neg/pos, asl_clip
-loss_name:       "asl"
+loss_name:       "focal_softmax"
 # BCE params (used when loss_name: bce)
 use_pos_weight:  true
 # Focal params (used when loss_name: focal | focal_softmax)
