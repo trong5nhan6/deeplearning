@@ -7,7 +7,7 @@ drop_path_rate:  0.3
 
 # ── Input mode ─────────────────────────────────────────────────────────────────
 # mode: single_image | dual_image
-mode:       "single_image"
+mode:       "dual_image"
 image_type: "dermoscopy"    # dermoscopy | clinical
 image_size: 224
 
@@ -68,7 +68,7 @@ use_pos_weight:  true
 focal_alpha:     0.25
 focal_gamma:     2.0
 # Softmax CE / Focal-Softmax params
-label_smoothing: 0.0
+label_smoothing: 0.1
 # ASL params (used when loss_name: asl)
 asl_gamma_neg:   4.0
 asl_gamma_pos:   0.0
