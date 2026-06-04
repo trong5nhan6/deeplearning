@@ -52,7 +52,17 @@ def _rebuild_meta_processor(cfg):
 
 
 def infer(config_path, checkpoint, test_csv, out_path, image_dir=None, use_tta=False):
-    cfg    = load_config(config_path)
+    # ── Load checkpoint raw để đọc cfg đã lưu bên trong ──────────────────────
+    raw_ckpt = torch.load(checkpoint, map_location="cpu")
+    # Ưu tiên cfg được save lúc train (đảm bảo kiến trúc model khớp 100%)
+    # Fallback sang config file nếu checkpoint cũ không lưu cfg
+    if "cfg" in raw_ckpt:
+        cfg = raw_ckpt["cfg"]
+        print(f"[infer] Using cfg saved in checkpoint (mode={cfg.get('mode')}, model={cfg.get('model_name')})")
+    else:
+        cfg = load_config(config_path)
+        print(f"[infer] cfg not found in checkpoint, using config file: {config_path}")
+
     device = get_device()
     set_seed(cfg.get("seed", 42))
     use_amp = cfg.get("use_amp", True) and torch.cuda.is_available()

@@ -76,7 +76,7 @@ asl_clip:        0.05
 
 # ── Sampler ────────────────────────────────────────────────────────────────────
 use_weighted_sampler: true
-mixup_alpha:          0.2   # 0.0 = disabled
+mixup_alpha:          0.0   # 0.0 = disabled
 
 # ── Early stopping ─────────────────────────────────────────────────────────────
 early_stopping_patience: 10
