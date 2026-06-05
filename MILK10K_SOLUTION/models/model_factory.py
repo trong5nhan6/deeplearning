@@ -11,6 +11,7 @@ Supported backbones (via timm):
   efficientnet_b3
   maxvit_tiny_tf_224
   vit_base_patch16_224
+  hycnn_trans_xattnres        (HyCNN-Trans-XAttnRes dual-encoder)
   ... and any other timm model name
 """
 
@@ -24,6 +25,7 @@ import torch.nn as nn
 from models.dual_branch import DualBranchModel
 from models.efficientnet import EfficientNetModel
 from models.convnext import ConvNextModel
+from models.hycnn_trans_xattnres import HyCNNTransXAttnRes
 from models.swin import SwinModel
 from models.maxvit import MaxViTModel
 from models.vit import ViTModel
@@ -77,6 +79,24 @@ def build_model(
 
     effective_meta_dim = meta_dim if use_metadata else 0
 
+    # ── HyCNN-Trans-XAttnRes ──────────────────────────────────────────────────
+    if model_name == "hycnn_trans_xattnres":
+        return HyCNNTransXAttnRes(
+            num_classes    = num_classes,
+            pretrained     = pretrained,
+            attn_dim       = cfg.get("attn_dim", 768),
+            num_heads      = cfg.get("num_heads", 8),
+            window_size    = cfg.get("window_size", 8),
+            mode           = mode,
+            image_type     = cfg.get("image_type", "dermoscopy"),
+            use_metadata   = use_metadata,
+            meta_dim       = effective_meta_dim,
+            meta_hidden    = cfg.get("meta_hidden", 256),
+            dropout        = drop_rate,
+            drop_path_rate = drop_path_rate,
+        )
+
+    # ── Dual-branch generic models ────────────────────────────────────────────
     if mode == "dual_image":
         model = DualBranchModel(
             backbone_name=model_name,

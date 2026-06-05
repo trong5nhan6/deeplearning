@@ -36,7 +36,7 @@ def run_inference(model, loader, device, use_amp=True):
                 meta = batch.get("metadata")
                 if meta is not None:
                     meta = meta.to(device, non_blocking=True)
-                logits = model(img, meta)
+                logits = model(img, metadata=meta)
         all_probs.append(torch.sigmoid(logits).cpu().numpy())
     return all_lesions, np.vstack(all_probs)
 

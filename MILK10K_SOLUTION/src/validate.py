@@ -110,4 +110,4 @@ def _forward(model: nn.Module, batch: Dict, device: torch.device) -> torch.Tenso
         meta = batch.get("metadata")
         if meta is not None:
             meta = meta.to(device, non_blocking=True)
-        return model(img, meta)
+        return model(img, metadata=meta)

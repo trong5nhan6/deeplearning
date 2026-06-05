@@ -372,13 +372,17 @@ class HyCNNTransXAttnRes(nn.Module):
 
     Forward signature (single_image)
     ---------------------------------
-    model(image)                            # no metadata
-    model(image, metadata=meta_tensor)      # with metadata
+    model(image)                               # no metadata
+    model(image, metadata=meta_tensor)         # with metadata
 
     Forward signature (dual_image)
     --------------------------------
-    model(derm_image, clin_image)                          # no metadata
-    model(derm_image, clin_image, metadata=meta_tensor)    # with metadata
+    model(clin_image, derm_image)                          # no metadata
+    model(clin_image, derm_image, metadata=meta_tensor)    # with metadata
+
+    Note: argument order matches the pipeline convention in _forward / run_inference:
+      positional-1 = clinical image  → clin_encoder (SwinV2-S)
+      positional-2 = dermoscopy image → derm_encoder (ConvNeXt-S)
     """
 
     # Channels at each stage for ConvNeXt-S / SwinV2-S (they match)
@@ -493,40 +497,40 @@ class HyCNNTransXAttnRes(nn.Module):
 
     def forward(
         self,
-        image_or_derm: torch.Tensor,
-        clin_image:    Optional[torch.Tensor] = None,
+        image_or_clin: torch.Tensor,
+        derm_image:    Optional[torch.Tensor] = None,
         metadata:      Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Parameters
         ----------
         single_image mode:
-            image_or_derm : [B, 3, H, W]  single image (derm or clinical)
-            clin_image    : None
+            image_or_clin : [B, 3, H, W]  single image → both branches
+            derm_image    : None
             metadata      : [B, meta_dim]  từ MetadataProcessor.transform() — optional
 
         dual_image mode:
-            image_or_derm : [B, 3, H, W]  dermoscopy image  → ConvNeXt
-            clin_image    : [B, 3, H, W]  clinical image    → SwinV2
+            image_or_clin : [B, 3, H, W]  clinical image   → clin_encoder (SwinV2)
+            derm_image    : [B, 3, H, W]  dermoscopy image → derm_encoder (ConvNeXt)
             metadata      : [B, meta_dim]  từ MetadataProcessor.transform() — optional
 
         Returns
         -------
         logits : [B, num_classes]
         """
-        B = image_or_derm.shape[0]
+        B = image_or_clin.shape[0]
 
         # ── Resolve inputs theo mode ──────────────────────────────────────────
         if self.mode == "single_image":
             # Một ảnh đi vào cả hai branch
-            derm_input = image_or_derm
-            clin_input = image_or_derm
+            clin_input = image_or_clin
+            derm_input = image_or_clin
         else:
-            # dual_image: derm → ConvNeXt, clinical → SwinV2
-            assert clin_image is not None, \
-                "dual_image mode requires both derm and clinical images"
-            derm_input = image_or_derm
-            clin_input = clin_image
+            # dual_image: clinical → SwinV2, derm → ConvNeXt
+            assert derm_image is not None, \
+                "dual_image mode requires both clinical and derm images"
+            clin_input = image_or_clin
+            derm_input = derm_image
 
         # ── Stage 1: Dual encoder forward (completely independent) ────────────
         derm_feats = self.derm_encoder(derm_input)   # list[4] of BCHW
@@ -617,54 +621,54 @@ def build_hycnn_trans_xattnres(cfg, meta_processor=None) -> HyCNNTransXAttnRes:
 # Quick sanity check
 # ═══════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    B = 2
-    derm = torch.randn(B, 3, 256, 256).to(device)
-    clin = torch.randn(B, 3, 256, 256).to(device)
-    # meta_dim=28: 3 (age/sex/tone) + 11 (site one-hot) + 14 (7 MONET × 2 views)
-    # — giá trị này đến từ MetadataProcessor.meta_dim sau khi .fit(), không hardcode
-    META_DIM = 28
-    meta = torch.randn(B, META_DIM).to(device)
+# if __name__ == "__main__":
+#     device = "cuda" if torch.cuda.is_available() else "cpu"
+#     B = 2
+#     derm = torch.randn(B, 3, 256, 256).to(device)
+#     clin = torch.randn(B, 3, 256, 256).to(device)
+#     # meta_dim=28: 3 (age/sex/tone) + 11 (site one-hot) + 14 (7 MONET × 2 views)
+#     # — giá trị này đến từ MetadataProcessor.meta_dim sau khi .fit(), không hardcode
+#     META_DIM = 28
+#     meta = torch.randn(B, META_DIM).to(device)
 
-    # ── Test 1: dual_image, no metadata ──────────────────────────────────────
-    print("=" * 60)
-    print("Test 1: mode=dual_image, use_metadata=False")
-    m = HyCNNTransXAttnRes(num_classes=11, pretrained=False,
-                           mode="dual_image", use_metadata=False).to(device)
-    out = m(derm, clin)
-    assert out.shape == (B, 11), f"Expected (2,11), got {out.shape}"
-    print(f"  Output: {out.shape}  ✓")
+#     # ── Test 1: dual_image, no metadata ──────────────────────────────────────
+#     print("=" * 60)
+#     print("Test 1: mode=dual_image, use_metadata=False")
+#     m = HyCNNTransXAttnRes(num_classes=11, pretrained=False,
+#                            mode="dual_image", use_metadata=False).to(device)
+#     out = m(clin, derm)   # (clinical, derm) — matches pipeline convention
+#     assert out.shape == (B, 11), f"Expected (2,11), got {out.shape}"
+#     print(f"  Output: {out.shape}  ✓")
 
-    # ── Test 2: dual_image, with metadata ────────────────────────────────────
-    print("Test 2: mode=dual_image, use_metadata=True")
-    m = HyCNNTransXAttnRes(num_classes=11, pretrained=False,
-                           mode="dual_image", use_metadata=True,
-                           meta_dim=META_DIM).to(device)
-    out = m(derm, clin, metadata=meta)
-    assert out.shape == (B, 11), f"Expected (2,11), got {out.shape}"
-    print(f"  Output: {out.shape}  ✓")
+#     # ── Test 2: dual_image, with metadata ────────────────────────────────────
+#     print("Test 2: mode=dual_image, use_metadata=True")
+#     m = HyCNNTransXAttnRes(num_classes=11, pretrained=False,
+#                            mode="dual_image", use_metadata=True,
+#                            meta_dim=META_DIM).to(device)
+#     out = m(clin, derm, metadata=meta)
+#     assert out.shape == (B, 11), f"Expected (2,11), got {out.shape}"
+#     print(f"  Output: {out.shape}  ✓")
 
-    # ── Test 3: single_image (dermoscopy), no metadata ────────────────────────
-    print("Test 3: mode=single_image, image_type=dermoscopy, use_metadata=False")
-    m = HyCNNTransXAttnRes(num_classes=11, pretrained=False,
-                           mode="single_image", image_type="dermoscopy",
-                           use_metadata=False).to(device)
-    out = m(derm)
-    assert out.shape == (B, 11), f"Expected (2,11), got {out.shape}"
-    print(f"  Output: {out.shape}  ✓")
+#     # ── Test 3: single_image (dermoscopy), no metadata ────────────────────────
+#     print("Test 3: mode=single_image, image_type=dermoscopy, use_metadata=False")
+#     m = HyCNNTransXAttnRes(num_classes=11, pretrained=False,
+#                            mode="single_image", image_type="dermoscopy",
+#                            use_metadata=False).to(device)
+#     out = m(derm)
+#     assert out.shape == (B, 11), f"Expected (2,11), got {out.shape}"
+#     print(f"  Output: {out.shape}  ✓")
 
-    # ── Test 4: single_image (clinical), with metadata ────────────────────────
-    print("Test 4: mode=single_image, image_type=clinical, use_metadata=True")
-    m = HyCNNTransXAttnRes(num_classes=11, pretrained=False,
-                           mode="single_image", image_type="clinical",
-                           use_metadata=True, meta_dim=META_DIM).to(device)
-    out = m(clin, metadata=meta)
-    assert out.shape == (B, 11), f"Expected (2,11), got {out.shape}"
-    print(f"  Output: {out.shape}  ✓")
+#     # ── Test 4: single_image (clinical), with metadata ────────────────────────
+#     print("Test 4: mode=single_image, image_type=clinical, use_metadata=True")
+#     m = HyCNNTransXAttnRes(num_classes=11, pretrained=False,
+#                            mode="single_image", image_type="clinical",
+#                            use_metadata=True, meta_dim=META_DIM).to(device)
+#     out = m(clin, metadata=meta)
+#     assert out.shape == (B, 11), f"Expected (2,11), got {out.shape}"
+#     print(f"  Output: {out.shape}  ✓")
 
-    # ── Param count ───────────────────────────────────────────────────────────
-    print("=" * 60)
-    total = sum(p.numel() for p in m.parameters()) / 1e6
-    print(f"  Total params: {total:.1f}M")
-    print("All tests passed!")
+#     # ── Param count ───────────────────────────────────────────────────────────
+#     print("=" * 60)
+#     total = sum(p.numel() for p in m.parameters()) / 1e6
+#     print(f"  Total params: {total:.1f}M")
+#     print("All tests passed!")
