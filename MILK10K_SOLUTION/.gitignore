@@ -31,3 +31,7 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+# Personal notes / scratch
+daily/
+idea/
