@@ -168,7 +168,7 @@ def train_epoch(model, loader, criterion, optimizer, scaler, device,
 def _build_datasets(cfg):
     train_csv = cfg["train_csv"]
     val_csv   = cfg["val_csv"]
-    image_dir = cfg.get("image_dir")
+    image_dir = cfg.get("image_dir") or cfg.get("train_image_dir")
     mode      = cfg.get("mode", "single_image")
     img_type  = cfg.get("image_type", "dermoscopy")
     use_meta  = cfg.get("use_metadata", False)
