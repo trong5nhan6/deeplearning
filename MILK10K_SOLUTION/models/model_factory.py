@@ -26,6 +26,7 @@ from models.dual_branch import DualBranchModel
 from models.efficientnet import EfficientNetModel
 from models.convnext import ConvNextModel
 from models.hycnn_trans_xattnres import HyCNNTransXAttnRes
+from models.hycnn_trans_softmoe import HyCNNTransSoftMoE
 from models.swin import SwinModel
 from models.maxvit import MaxViTModel
 from models.vit import ViTModel
@@ -78,6 +79,26 @@ def build_model(
     drop_path_rate = cfg.get("drop_path_rate", 0.1)
 
     effective_meta_dim = meta_dim if use_metadata else 0
+
+    # ── HyCNN-Trans-SoftMoE ──────────────────────────────────────────────────
+    if model_name == "hycnn_trans_softmoe":
+        return HyCNNTransSoftMoE(
+            num_classes    = num_classes,
+            pretrained     = pretrained,
+            embed_dim      = cfg.get("embed_dim", 768),
+            num_heads      = cfg.get("num_heads", 8),
+            window_size    = cfg.get("window_size", 8),
+            n_experts      = cfg.get("n_experts", 4),
+            n_slots        = cfg.get("n_slots",   1),
+            moe_expand     = cfg.get("moe_expand", 4),
+            mode           = mode,
+            image_type     = cfg.get("image_type", "dermoscopy"),
+            use_metadata   = use_metadata,
+            meta_dim       = effective_meta_dim,
+            meta_hidden    = cfg.get("meta_hidden", 256),
+            dropout        = drop_rate,
+            drop_path_rate = drop_path_rate,
+        )
 
     # ── HyCNN-Trans-XAttnRes ──────────────────────────────────────────────────
     if model_name == "hycnn_trans_xattnres":

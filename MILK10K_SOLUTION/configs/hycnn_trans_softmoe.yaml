@@ -1,29 +1,35 @@
 # ── Model ──────────────────────────────────────────────────────────────────────
-model_name:      "hycnn_trans_xattnres"
+model_name:      "hycnn_trans_softmoe"
 pretrained:      true
 num_classes:     11
-attn_dim:        768
+embed_dim:       768          # unified token dim (thay attn_dim trong XAttnRes)
 num_heads:       8
 window_size:     8
 drop_rate:       0.1
 drop_path_rate:  0.1
+
+# ── SoftMoE ─────────────────────────────────────────────────────────────────────
+# n_experts: số expert FFN (mặc định 4, match số stage)
+# moe_expand: FFN expansion ratio trong mỗi expert (mặc định 4, như Transformer)
+n_experts:   4
+n_slots:     1     # slots per expert (p) — tổng slots = n_experts * n_slots
+moe_expand:  2
 
 # ── Input mode ─────────────────────────────────────────────────────────────────
 # mode: single_image | dual_image
 #   single_image → một ảnh đi vào cả 2 branch (ConvNeXt + SwinV2)
 #   dual_image   → derm → ConvNeXt-S,  clinical → SwinV2-S
 mode:       "dual_image"
-image_type: "dermoscopy"    # chỉ dùng khi mode=single_image (dermoscopy | clinical)
+image_type: "dermoscopy"    # chỉ dùng khi mode=single_image
 image_size: 256
 
 # ── Metadata ───────────────────────────────────────────────────────────────────
-# use_metadata=true  → metadata của bệnh nhân làm pseudo-query trong AttnRes
-# use_metadata=false → fixed learnable pseudo-query (như paper gốc XAttnRes)
+# use_metadata=true  → tabular token được append vào SoftMoE sequence (token thứ 5)
+# use_metadata=false → dùng learnable fixed token (như CLS token)
 #
-# KHÔNG có meta_dim ở đây — được tính tự động từ MetadataProcessor.meta_dim
-# sau khi .fit() trên train set (thường = 28: 3 + 11 sites + 14 MONET)
-use_metadata:   false
-meta_hidden:    256         # hidden dim của metadata MLP (architecture choice)
+# KHÔNG có meta_dim ở đây — tính tự động từ MetadataProcessor.meta_dim sau .fit()
+use_metadata:   true
+meta_hidden:    256
 
 # ── Column names ───────────────────────────────────────────────────────────────
 lesion_col:   "lesion_id"
@@ -36,17 +42,16 @@ val_csv:         "datasets/MILK10k/splits/val_fold0.csv"
 test_csv:        "datasets/MILK10k/test/test_combined.csv"
 train_image_dir: "datasets/MILK10k/train/MILK10k_Training_Input"
 test_image_dir:  "datasets/MILK10k/test/MILK10k_Test_Input"
-image_dir: "datasets/MILK10k/train/MILK10k_Training_Input"
 
 # ── Training ───────────────────────────────────────────────────────────────────
 epochs:      30
-batch_size:  16             # nhỏ hơn các model khác vì dual encoder + cross-attn
+batch_size:  16             # dual encoder + cross-attn + SoftMoE — giữ nhỏ
 num_workers: 4
 seed:        42
 
 # ── Optimizer ──────────────────────────────────────────────────────────────────
 optimizer:    "adamw"
-lr:           3.0e-5        # lr nhỏ hơn vì model lớn hơn
+lr:           3.0e-5
 weight_decay: 1.0e-4
 
 # ── Scheduler ──────────────────────────────────────────────────────────────────
