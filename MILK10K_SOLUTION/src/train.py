@@ -10,7 +10,10 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
 from src.dataset import MILK10kDataset, MetadataProcessor, build_meta_processor
-from src.losses import compute_class_weight, compute_pos_weight, get_loss
+from src.losses import (
+    compute_class_weight, compute_class_freq,
+    compute_pos_weight, get_loss,
+)
 from src.metrics import LABEL_COLS, concat_outputs, compute_metrics
 from src.transforms import get_train_transforms, get_val_transforms
 from src.utils import (
@@ -246,6 +249,8 @@ def train(cfg, model):
 
     pos_weight   = None
     class_weight = None
+    class_freq   = None
+    class_counts = None
     loss_name    = cfg.get("loss_name", "bce").lower()
 
     if all(c in train_ds.df.columns for c in LABEL_COLS):
@@ -255,14 +260,41 @@ def train(cfg, model):
             pos_weight = compute_pos_weight(labels_np).to(device)
             logger.info(f"  pos_weight: {[round(x,2) for x in pos_weight.tolist()]}")
 
-        if loss_name in ("softmax_ce", "ce", "cross_entropy",
-                         "focal_softmax", "softmax_focal", "ce_focal"):
-            class_weight = compute_class_weight(labels_np).to(device)
-            logger.info(f"  class_weight: {[round(x,2) for x in class_weight.tolist()]}")
+        # class_weight: dùng cho focal_softmax, ldam (DRW stage 2)
+        _cw_losses = ("softmax_ce", "ce", "cross_entropy",
+                      "focal_softmax", "softmax_focal", "ce_focal",
+                      "ldam", "ldam_drw")
+        if loss_name in _cw_losses:
+            cw_mode = cfg.get("class_weight_mode", "effective")
+            class_weight = compute_class_weight(
+                labels_np,
+                clip=cfg.get("class_weight_clip", 50.0),
+                beta=cfg.get("class_weight_beta", 0.9999),
+                mode=cw_mode,
+            ).to(device)
+            logger.info(f"  class_weight ({cw_mode}): "
+                        f"{[round(x,2) for x in class_weight.tolist()]}")
+
+        # class_freq: dùng cho logit_adjustment
+        if loss_name in ("logit_adjustment", "la", "la_loss"):
+            class_freq = compute_class_freq(labels_np).to(device)
+            logger.info(f"  class_freq: {[round(x,4) for x in class_freq.tolist()]}")
+
+        # class_counts: dùng cho ldam
+        if loss_name in ("ldam", "ldam_drw"):
+            counts_np    = labels_np.sum(axis=0).clip(min=1)
+            class_counts = torch.tensor(counts_np, dtype=torch.float32).to(device)
+            logger.info(f"  class_counts: {[int(x) for x in counts_np.tolist()]}")
 
     loss_kwargs = {k: v for k, v in cfg.items() if k != "loss_name"}
-    criterion = get_loss(loss_name, pos_weight=pos_weight,
-                         class_weight=class_weight, **loss_kwargs).to(device)
+    criterion = get_loss(
+        loss_name,
+        pos_weight=pos_weight,
+        class_weight=class_weight,
+        class_freq=class_freq,
+        class_counts=class_counts,
+        **loss_kwargs,
+    ).to(device)
 
     optimizer = get_optimizer(
         model, cfg.get("optimizer", "adamw"),

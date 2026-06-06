@@ -59,12 +59,28 @@ use_amp:   true
 clip_grad: 1.0
 
 # ── Loss ───────────────────────────────────────────────────────────────────────
-loss_name:       "focal_softmax"
-focal_gamma:     2.0
-label_smoothing: 0.0
+# Options:
+#   focal_softmax      → class-weighted focal (baseline)
+#   logit_adjustment   → LA loss (Menon 2021), requires la_tau
+#   ldam               → LDAM loss (Cao 2019), can combine with DRW via scheduler
+#   ldam_drw           → LDAM + deferred re-weighting (turn on class_weight at epoch drw_start)
+loss_name:       "logit_adjustment"
+label_smoothing: 0.1
+
+# Logit Adjustment params
+la_tau:          1.0          # τ: scale factor for log-prior adjustment (1.0 = full adjustment)
+
+# LDAM params (dùng khi loss_name = ldam / ldam_drw)
+ldam_c:          0.5          # C trong margin = C / n_k^(1/4)
+drw_start:       10           # epoch bắt đầu deferred re-weighting (chỉ dùng ldam_drw)
+
+# Class weight params (dùng khi loss cần class_weight: focal_softmax, ldam, ldam_drw)
+class_weight_mode: "effective"   # effective | inv_sqrt | inv_freq
+class_weight_clip: 50.0
+class_weight_beta: 0.9999
 
 # ── Sampler ────────────────────────────────────────────────────────────────────
-use_weighted_sampler: false
+use_weighted_sampler: true
 
 # ── Early stopping ─────────────────────────────────────────────────────────────
 early_stopping_patience: 10
