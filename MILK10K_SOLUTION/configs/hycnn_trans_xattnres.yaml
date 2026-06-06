@@ -82,6 +82,19 @@ class_weight_beta: 0.9999
 # ── Sampler ────────────────────────────────────────────────────────────────────
 use_weighted_sampler: true
 
+# ── cRT (Classifier Re-Training) — Kang et al. ICLR 2020 ──────────────────────
+# Stage 1: train bình thường (code chạy đến đây như cũ)
+# Stage 2: freeze backbone, retrain classifier với class-balanced sampler
+#
+# use_crt: true  → kích hoạt stage 2 sau khi stage 1 kết thúc
+# crt_epochs    : số epoch stage 2 (10-15 là đủ vì chỉ train head)
+# crt_lr        : lr nhỏ hơn stage 1 (head đã có feature tốt, chỉ cần fine-tune boundary)
+# crt_batch_size: batch cho stage 2 (có thể tăng vì không cần full forward qua backbone)
+use_crt:          true
+crt_epochs:       12
+crt_lr:           5.0e-5
+crt_batch_size:   32
+
 # ── Early stopping ─────────────────────────────────────────────────────────────
 early_stopping_patience: 10
 

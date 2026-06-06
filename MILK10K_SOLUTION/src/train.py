@@ -126,6 +126,194 @@ def _apply_mixup(batch, labels, alpha, device):
     return batch, labels_b, lam
 
 
+# ── cRT (Classifier Re-Training) helpers ─────────────────────────────────────
+
+def _get_head_names(model: nn.Module) -> list:
+    """
+    Return the attribute names of the classifier head submodules.
+    - HyCNN-Trans models: ['head_norm', 'head']
+    - Single-branch models: ['classifier']
+    """
+    candidates = ["head_norm", "head", "classifier", "fc"]
+    return [n for n in candidates if hasattr(model, n)
+            and isinstance(getattr(model, n), nn.Module)]
+
+
+def _freeze_backbone(model: nn.Module, head_names: list) -> int:
+    """
+    Freeze all parameters except those belonging to head_names modules.
+    Returns number of frozen parameters (for logging).
+    """
+    head_param_ids = set()
+    for name in head_names:
+        for p in getattr(model, name).parameters():
+            head_param_ids.add(id(p))
+
+    n_frozen = 0
+    for p in model.parameters():
+        if id(p) not in head_param_ids:
+            p.requires_grad_(False)
+            n_frozen += p.numel()
+    return n_frozen
+
+
+def _unfreeze_all(model: nn.Module):
+    """Re-enable gradients for all parameters."""
+    for p in model.parameters():
+        p.requires_grad_(True)
+
+
+def _build_balanced_sampler(train_ds) -> WeightedRandomSampler:
+    """
+    Strictly class-balanced sampler: weight_i = 1 / n_{c_i}.
+    Each class has equal expected representation per batch.
+    """
+    labels    = train_ds.df[LABEL_COLS].values
+    main_cls  = np.argmax(labels, axis=1)
+    counts    = np.bincount(main_cls, minlength=len(LABEL_COLS)).clip(min=1)
+    sample_w  = 1.0 / counts[main_cls]
+    sample_w  = sample_w / sample_w.sum()
+    return WeightedRandomSampler(
+        weights=torch.tensor(sample_w, dtype=torch.float32),
+        num_samples=len(train_ds),
+        replacement=True,
+    )
+
+
+def _run_crt_stage2(model, train_ds, val_loader, criterion, cfg, device,
+                    ckpt_dir: str, log_dir: Path, logger) -> float:
+    """
+    cRT Stage 2 — Kang et al. ICLR 2020.
+
+    1. Load best stage-1 checkpoint.
+    2. Freeze backbone; only classifier head is trainable.
+    3. Train with class-balanced sampler for crt_epochs.
+    4. Save best_crt.pth and last_crt.pth.
+
+    Returns best val macro-F1 achieved in stage 2.
+    """
+    from src.utils import load_checkpoint
+
+    # ── load stage-1 best weights ────────────────────────────────────────────
+    best_s1 = Path(ckpt_dir) / "best.pth"
+    if best_s1.exists():
+        load_checkpoint(str(best_s1), model, device=str(device))
+        logger.info(f"[cRT] Loaded stage-1 best: {best_s1}")
+    else:
+        logger.warning("[cRT] best.pth not found — using current weights for stage 2")
+
+    # ── freeze backbone ──────────────────────────────────────────────────────
+    head_names = _get_head_names(model)
+    n_frozen   = _freeze_backbone(model, head_names)
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"[cRT] Frozen {n_frozen/1e6:.2f}M params | "
+                f"Trainable {n_trainable/1e6:.2f}M params | head={head_names}")
+
+    # ── class-balanced dataloader ────────────────────────────────────────────
+    crt_bs     = cfg.get("crt_batch_size", cfg.get("batch_size", 32))
+    bal_loader = DataLoader(
+        train_ds,
+        batch_size=crt_bs,
+        sampler=_build_balanced_sampler(train_ds),
+        num_workers=cfg.get("num_workers", 4),
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    # ── optimizer on head params only ────────────────────────────────────────
+    crt_lr      = cfg.get("crt_lr", 1e-5)
+    head_params = []
+    for name in head_names:
+        head_params += list(getattr(model, name).parameters())
+    optimizer = torch.optim.AdamW(
+        head_params, lr=crt_lr,
+        weight_decay=cfg.get("weight_decay", 1e-4),
+    )
+
+    crt_epochs = cfg.get("crt_epochs", 10)
+    scheduler  = get_scheduler(
+        optimizer, "cosine",
+        epochs=crt_epochs,
+        steps_per_epoch=len(bal_loader),
+        warmup_epochs=max(1, crt_epochs // 10),
+        eta_min=cfg.get("eta_min", 1e-7),
+    )
+
+    use_amp   = cfg.get("use_amp", True) and torch.cuda.is_available()
+    scaler    = torch.amp.GradScaler("cuda", enabled=use_amp)
+    clip_grad = cfg.get("clip_grad", 1.0)
+    threshold = cfg.get("threshold", 0.5)
+    model_name = cfg.get("model_name", "model")
+
+    csv_log = CSVLogger(
+        path=str(log_dir / f"{model_name}_crt_log.csv"),
+        fieldnames=["epoch", "train_loss", "train_acc", "train_f1",
+                    "val_loss", "val_acc", "macro_f1", "lr"]
+                   + [f"f1_{c}" for c in LABEL_COLS],
+    )
+
+    best_f1 = -1.0
+    timer   = Timer()
+    logger.info(f"[cRT] Stage 2 | epochs={crt_epochs}  lr={crt_lr:.1e}  bs={crt_bs}")
+
+    for epoch in range(1, crt_epochs + 1):
+        train_loss, train_acc, train_f1 = train_epoch(
+            model, bal_loader, criterion, optimizer,
+            scaler, device, clip_grad, use_amp, threshold,
+        )
+        val_loss, mf1, pc_f1, val_acc = validate_epoch(
+            model, val_loader, criterion, device,
+            threshold=threshold, use_amp=use_amp,
+        )
+        scheduler.step()
+
+        is_best  = mf1 > best_f1
+        best_tag = " [BEST]" if is_best else ""
+        cls_str  = "  ".join(f"{k[:4]}={v:.2f}" for k, v in pc_f1.items())
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        logger.info(
+            f"[cRT {epoch:02d}/{crt_epochs}]"
+            f"  Loss {train_loss:.4f}/{val_loss:.4f}"
+            f"  Acc {train_acc:.4f}/{val_acc:.4f}"
+            f"  F1 {train_f1:.4f}/{mf1:.4f}"
+            f"  lr={current_lr:.1e}"
+            f"  {timer.elapsed()}{best_tag}"
+        )
+        logger.info(f"         {cls_str}")
+
+        csv_log.log({
+            "epoch":      f"crt_{epoch}",
+            "train_loss": round(train_loss, 6),
+            "train_acc":  round(train_acc,  6),
+            "train_f1":   round(train_f1,   6),
+            "val_loss":   round(val_loss,   6),
+            "val_acc":    round(val_acc,    6),
+            "macro_f1":   round(mf1,        6),
+            "lr":         round(current_lr, 10),
+            **{f"f1_{c}": round(pc_f1.get(c, 0.0), 6) for c in LABEL_COLS},
+        })
+
+        if is_best:
+            best_f1 = mf1
+            save_checkpoint(
+                {"epoch": f"crt_{epoch}", "model_state_dict": model.state_dict(),
+                 "best_macro_f1": best_f1, "cfg": cfg},
+                checkpoint_dir=ckpt_dir, filename="best_crt.pth",
+            )
+        save_checkpoint(
+            {"epoch": f"crt_{epoch}", "model_state_dict": model.state_dict(),
+             "macro_f1": mf1, "cfg": cfg},
+            checkpoint_dir=ckpt_dir, filename="last_crt.pth",
+        )
+
+    _unfreeze_all(model)
+    logger.info(f"[cRT] Stage 2 done  best_crt_f1={best_f1:.4f}")
+    return best_f1
+
+
+# ── Training loop ─────────────────────────────────────────────────────────────
+
 def train_epoch(model, loader, criterion, optimizer, scaler, device,
                 clip_grad=1.0, use_amp=True, threshold=0.5, mixup_alpha=0.0):
     model.train()
@@ -394,6 +582,28 @@ def train(cfg, model):
         if early_stop(mf1):
             logger.info(f"Early stopping at epoch {epoch}")
             break
+
+    # ── Stage 2: cRT (optional) ──────────────────────────────────────────────
+    if cfg.get("use_crt", False):
+        import shutil
+        crt_f1 = _run_crt_stage2(
+            model, train_ds, val_loader, criterion, cfg, device,
+            str(ckpt_dir), log_dir, logger,
+        )
+        # Nếu cRT cải thiện F1, dùng best_crt.pth làm best.pth chính thức
+        crt_best_path = Path(ckpt_dir) / "best_crt.pth"
+        if crt_best_path.exists() and crt_f1 > best_f1:
+            shutil.copy2(str(crt_best_path), str(Path(ckpt_dir) / "best.pth"))
+            logger.info(
+                f"[cRT] best_crt.pth (f1={crt_f1:.4f}) > stage-1 best (f1={best_f1:.4f})"
+                " → replaced best.pth"
+            )
+            best_f1 = crt_f1
+        else:
+            logger.info(
+                f"[cRT] cRT f1={crt_f1:.4f} did not improve stage-1 f1={best_f1:.4f}"
+                " — keeping original best.pth"
+            )
 
     _log_final_summary(model, val_loader, device, threshold, use_amp, logger, cfg, str(ckpt_dir))
     _auto_submit(model, cfg, device, use_amp, str(ckpt_dir), meta_processor, logger)

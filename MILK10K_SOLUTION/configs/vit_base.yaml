@@ -72,6 +72,12 @@ asl_clip:        0.05
 # ── Sampler ────────────────────────────────────────────────────────────────────
 use_weighted_sampler: false
 
+# ── cRT (Classifier Re-Training) — Kang et al. ICLR 2020 ──────────────────────
+use_crt:          false
+crt_epochs:       10
+crt_lr:           1.0e-5
+crt_batch_size:   32
+
 # ── Early stopping ─────────────────────────────────────────────────────────────
 early_stopping_patience: 10
 

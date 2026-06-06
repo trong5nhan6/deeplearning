@@ -64,12 +64,35 @@ use_amp:   true
 clip_grad: 1.0
 
 # ── Loss ───────────────────────────────────────────────────────────────────────
-loss_name:       "focal_softmax"
-focal_gamma:     2.0
-label_smoothing: 0.0
+# Options:
+#   focal_softmax      → class-weighted focal (baseline)
+#   logit_adjustment   → LA loss (Menon 2021), requires la_tau
+#   ldam               → LDAM loss (Cao 2019), can combine with DRW
+#   ldam_drw           → LDAM + deferred re-weighting
+loss_name:       "logit_adjustment"
+label_smoothing: 0.1
+
+# Logit Adjustment params
+la_tau:          1.0
+
+# LDAM params (dùng khi loss_name = ldam / ldam_drw)
+ldam_c:          0.5
+drw_start:       10
+
+# Class weight params (dùng khi loss cần class_weight)
+class_weight_mode: "effective"
+class_weight_clip: 50.0
+class_weight_beta: 0.9999
 
 # ── Sampler ────────────────────────────────────────────────────────────────────
-use_weighted_sampler: false
+use_weighted_sampler: true
+
+# ── cRT (Classifier Re-Training) — Kang et al. ICLR 2020 ──────────────────────
+# Stage 2 sau main training: freeze backbone, retrain classifier với balanced sampler
+use_crt:          true
+crt_epochs:       12
+crt_lr:           5.0e-5
+crt_batch_size:   32
 
 # ── Early stopping ─────────────────────────────────────────────────────────────
 early_stopping_patience: 10
