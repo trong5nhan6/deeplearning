@@ -421,6 +421,15 @@ def _setup_bcl(model: nn.Module, cfg: dict, train_ds, device, criterion):
             _lbl = train_ds.df[_LC].values.astype(float)
             bcl_class_freq = compute_class_freq(_lbl).to(device)
 
+    # ── class_counts for feature augmentation ────────────────────────────────
+    bcl_class_counts = None
+    if cfg.get("bcl_feat_aug", False):
+        from src.metrics import LABEL_COLS as _LC2
+        if all(c in train_ds.df.columns for c in _LC2):
+            _lbl2 = train_ds.df[_LC2].values.astype(float)
+            _cnts = _lbl2.sum(axis=0).clip(min=1)
+            bcl_class_counts = torch.tensor(_cnts, dtype=torch.float32).to(device)
+
     bcl_criterion = BCLLoss(
         num_classes=cfg.get("num_classes", 11),
         feat_dim=proj_dim,
@@ -432,6 +441,17 @@ def _setup_bcl(model: nn.Module, cfg: dict, train_ds, device, criterion):
         use_weighted_supcon=cfg.get("bcl_weighted_supcon",       False),
         class_freq=bcl_class_freq,
         supcon_weight_clamp=cfg.get("bcl_supcon_weight_clamp",  20.0),
+        # Queue
+        queue_size=cfg.get("bcl_queue_size", 0),
+        # Feature augmentation
+        feat_aug=cfg.get("bcl_feat_aug",                         False),
+        feat_aug_warmup=cfg.get("bcl_feat_aug_warmup",           5),
+        feat_aug_minority_thresh=cfg.get("bcl_feat_aug_minority_thresh", 100),
+        feat_aug_per_sample=cfg.get("bcl_feat_aug_per_sample",   4),
+        feat_aug_alpha_min=cfg.get("bcl_feat_aug_alpha_min",     0.3),
+        feat_aug_alpha_max=cfg.get("bcl_feat_aug_alpha_max",     0.7),
+        feat_aug_noise_std=cfg.get("bcl_feat_aug_noise_std",     0.05),
+        class_counts=bcl_class_counts,
     ).to(device)
 
     return proj_head, bcl_criterion, hook_handle, feat_store
@@ -440,7 +460,7 @@ def _setup_bcl(model: nn.Module, cfg: dict, train_ds, device, criterion):
 def train_epoch_bcl(
     model, proj_head, loader, bcl_criterion, feat_store,
     optimizer, proj_optimizer, scaler, device,
-    clip_grad=1.0, use_amp=True, threshold=0.5,
+    clip_grad=1.0, use_amp=True, threshold=0.5, epoch: int = 1,
 ):
     """
     Training epoch for BCL.
@@ -478,7 +498,7 @@ def train_epoch_bcl(
                 raise RuntimeError("[BCL] Forward hook did not capture features. "
                                    "Check that _setup_bcl found the correct layer.")
             proj_feat = proj_head(feat)                          # [B, proj_dim] normalized
-            loss, loss_dict = bcl_criterion(logits, proj_feat, labels)
+            loss, loss_dict = bcl_criterion(logits, proj_feat, labels, epoch=epoch)
 
         scaler.scale(loss).backward()
 
@@ -495,12 +515,17 @@ def train_epoch_bcl(
         loss_meter.update(loss.item(), n=labels.size(0))
         all_logits.append(logits.detach().cpu())
         all_labels.append(labels.detach().cpu())
-        pbar.set_postfix({
+        postfix = {
             "loss":    f"{loss_meter.avg:.4f}",
             "l_ce":    f"{loss_dict['l_ce']:.3f}",
             "l_sup":   f"{loss_dict['l_sup']:.3f}",
             "l_proto": f"{loss_dict['l_proto']:.3f}",
-        })
+        }
+        if "n_aug" in loss_dict:
+            postfix["aug"] = int(loss_dict["n_aug"])
+        if "q_size" in loss_dict:
+            postfix["q"] = int(loss_dict["q_size"])
+        pbar.set_postfix(postfix)
 
     logits_np, labels_np = concat_outputs(all_logits, all_labels)
     metrics   = compute_metrics(logits_np, labels_np, threshold=threshold)
@@ -734,6 +759,20 @@ def train(cfg, model):
             f"  τ={cfg.get('bcl_temperature',0.07)}"
             f"  proj_lr={proj_lr:.1e}"
         )
+        if cfg.get("bcl_queue_size", 0) > 0:
+            logger.info(
+                f"[BCL] Queue enabled  size={cfg['bcl_queue_size']}"
+                f"  (fills in ~{cfg['bcl_queue_size'] // cfg.get('batch_size', 16)} steps)"
+            )
+        if cfg.get("bcl_feat_aug", False):
+            logger.info(
+                f"[BCL] FeatAug enabled"
+                f"  warmup={cfg.get('bcl_feat_aug_warmup', 5)}ep"
+                f"  minority_thresh={cfg.get('bcl_feat_aug_minority_thresh', 100)}"
+                f"  per_sample={cfg.get('bcl_feat_aug_per_sample', 4)}"
+                f"  α=[{cfg.get('bcl_feat_aug_alpha_min',0.3)},{cfg.get('bcl_feat_aug_alpha_max',0.7)}]"
+                f"  σ={cfg.get('bcl_feat_aug_noise_std',0.05)}"
+            )
 
     early_stop = EarlyStopping(patience=cfg.get("early_stopping_patience", 10), mode="max")
     csv_log = CSVLogger(
@@ -756,7 +795,7 @@ def train(cfg, model):
             train_loss, train_acc, train_f1 = train_epoch_bcl(
                 model, proj_head, train_loader, bcl_criterion, feat_store,
                 optimizer, proj_optimizer, scaler, device,
-                clip_grad, use_amp, threshold,
+                clip_grad, use_amp, threshold, epoch=epoch,
             )
         else:
             train_loss, train_acc, train_f1 = train_epoch(
@@ -781,6 +820,7 @@ def train(cfg, model):
 
         # Compact per-class F1 — two chars abbrev
         cls_str = "  ".join(f"{k[:4]}={v:.2f}" for k, v in pc_f1.items())
+
 
         logger.info(
             f"[{epoch:03d}/{epochs}]"
@@ -825,39 +865,37 @@ def train(cfg, model):
             logger.info(f"Early stopping at epoch {epoch}")
             break
 
-    # ── BCL cleanup ──────────────────────────────────────────────────────────
+    # BCL cleanup
     if use_bcl and bcl_hook is not None:
         bcl_hook.remove()
         logger.info("[BCL] Feature hook removed after stage 1.")
 
-    # ── Stage 2: cRT (optional) ──────────────────────────────────────────────
+    # Stage 2: cRT (optional)
     if cfg.get("use_crt", False):
         import shutil
         crt_f1 = _run_crt_stage2(
             model, train_ds, val_loader, cfg, device,
             str(ckpt_dir), log_dir, logger,
         )
-        # Nếu cRT cải thiện F1, dùng best_crt.pth làm best.pth chính thức
         crt_best_path = Path(ckpt_dir) / "best_crt.pth"
         if crt_best_path.exists() and crt_f1 > best_f1:
             shutil.copy2(str(crt_best_path), str(Path(ckpt_dir) / "best.pth"))
             logger.info(
                 f"[cRT] best_crt.pth (f1={crt_f1:.4f}) > stage-1 best (f1={best_f1:.4f})"
-                " → replaced best.pth"
+                " -> replaced best.pth"
             )
             best_f1 = crt_f1
         else:
             logger.info(
                 f"[cRT] cRT f1={crt_f1:.4f} did not improve stage-1 f1={best_f1:.4f}"
-                " — keeping original best.pth"
+                " -- keeping original best.pth"
             )
 
     _log_final_summary(model, val_loader, device, threshold, use_amp, logger, cfg,
                        str(ckpt_dir), log_dir=log_dir)
 
-    # ── Embedding visualization ──────────────────────────────────────────────
+    # Embedding visualization
     try:
-        # Prototypes from BCL (if available)
         _prototypes = None
         _proto_init = None
         if use_bcl and bcl_criterion is not None:
@@ -865,7 +903,7 @@ def train(cfg, model):
             _proto_init = bcl_criterion.proto.initialized
 
         viz_title = (
-            "BCL Embedding Space — contrastive projection (val set)"
+            "BCL Embedding Space -- contrastive projection (val set)"
             if use_bcl else
             "Backbone Embedding Space (val set)"
         )
@@ -874,7 +912,7 @@ def train(cfg, model):
             val_loader=val_loader,
             device=device,
             save_path=str(log_dir / f"{model_name}_embeddings.png"),
-            proj_head=proj_head,       # None if not BCL
+            proj_head=proj_head,
             prototypes=_prototypes,
             proto_init=_proto_init,
             use_amp=use_amp,

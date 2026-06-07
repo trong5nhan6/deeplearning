@@ -1,24 +1,11 @@
 """
 BCL -- Balanced Contrastive Learning (Zhu et al. CVPR 2022)
-=============================================================
-L_total = L_CE + lambda_sup * L_SupCon + lambda_proto * L_proto
-
-Motivation for MILK10k (IR = 280x, MAL_OTH = 18 samples):
-- L_CE alone cannot overcome extreme class imbalance
-- L_SupCon: pulls same-class features together, pushes other classes apart
-  -> better feature discriminability in embedding space
-- L_proto: pulls each feature toward its class prototype (running EMA centroid)
-  -> always provides gradient for minority classes via their accumulated prototype,
-     even when only 1 minority sample appears in a batch
-
-Supports two SupCon variants:
-  use_weighted_supcon=False -> standard SupConLoss    (equal weight per anchor)
-  use_weighted_supcon=True  -> WeightedSupConLoss     (anchor weight = 1/pi_k)
-    - minority anchors (MAL_OTH) get up to supcon_weight_clamp x more weight
-    - weight_clamp=20 prevents a single bad sample from exploding the gradient
++ Queue-based contrastive (BPaCo-style, MICCAI 2024)
++ Feature-space augmentation for minority classes
 """
 from __future__ import annotations
-
+import random
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,15 +16,7 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 
 class ProjectionHead(nn.Module):
-    """
-    2-layer MLP that projects backbone features into a contrastive embedding space.
-    Output is L2-normalized -> lives on the unit hypersphere.
-
-    Architecture:
-        Linear(in_dim -> hidden_dim) -> BN -> ReLU -> Linear(hidden_dim -> out_dim) -> L2-norm
-
-    BatchNorm stabilises training; L2-norm ensures cosine similarity == dot product.
-    """
+    """2-layer MLP -> BN -> ReLU -> Linear -> L2-norm. Output on unit hypersphere."""
 
     def __init__(self, in_dim: int, hidden_dim: int = 256, out_dim: int = 128):
         super().__init__()
@@ -49,99 +28,71 @@ class ProjectionHead(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.normalize(self.net(x), dim=1)  # [B, out_dim] on unit sphere
+        return F.normalize(self.net(x), dim=1)
 
 
 # ---------------------------------------------------------------------------
-# 2. SupConLoss (standard, equal weight)
+# 2. SupConLoss -- extended with optional extra_feats pool (aug + queue)
 # ---------------------------------------------------------------------------
 
 class SupConLoss(nn.Module):
     """
-    Supervised Contrastive Loss -- Khosla et al. NeurIPS 2020.
+    Supervised Contrastive Loss (Khosla et al. NeurIPS 2020).
 
-    For each anchor i:
-      L_i = -1/|P(i)| * sum_{p in P(i)} log [
-                exp(z_i . z_p / tau) / sum_{a != i} exp(z_i . z_a / tau)
-             ]
-    where P(i) = set of same-class samples in the batch (excluding i itself).
-
-    Notes:
-    - If a sample has no positive pair (only one sample of its class in batch),
-      it contributes 0 loss (skipped gracefully).
-    - Temperature tau < 0.1 -> sharper boundaries; tau=0.07 is the original default.
+    Extended: accepts optional extra_feats/extra_labels that extend the
+    positive/negative pool beyond the current batch.
+    Only `features` are used as anchors (get gradients).
     """
 
     def __init__(self, temperature: float = 0.07):
         super().__init__()
         self.temperature = temperature
 
-    def forward(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        """
-        features : [B, D] -- L2-normalized projected features
-        labels   : [B,]   -- class indices (long tensor)
-        Returns  : scalar loss
-        """
-        B, _ = features.shape
-        device = features.device
+    def forward(
+        self,
+        features:     torch.Tensor,
+        labels:       torch.Tensor,
+        extra_feats:  Optional[torch.Tensor] = None,
+        extra_labels: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, device = features.shape[0], features.device
 
-        sim = torch.matmul(features, features.T) / self.temperature   # [B, B]
+        if extra_feats is not None and extra_feats.size(0) > 0:
+            pool_f = torch.cat([features, extra_feats.to(device)], dim=0)
+            pool_l = torch.cat([labels,   extra_labels.to(device)], dim=0)
+        else:
+            pool_f, pool_l = features, labels
+        N = pool_f.shape[0]
 
-        mask_self = torch.eye(B, dtype=torch.bool, device=device)
-        labels_col = labels.unsqueeze(1)
-        mask_pos   = (labels_col == labels_col.T) & ~mask_self         # [B, B]
+        sim = torch.matmul(features, pool_f.T) / self.temperature  # [B, N]
+
+        mask_self = torch.zeros(B, N, dtype=torch.bool, device=device)
+        mask_self[:, :B] = torch.eye(B, dtype=torch.bool, device=device)
+        mask_pos = (labels.unsqueeze(1) == pool_l.unsqueeze(0)) & ~mask_self
 
         if mask_pos.sum() == 0:
             return features.sum() * 0.0
 
         sim_max, _ = sim.max(dim=1, keepdim=True)
-        sim = sim - sim_max.detach()                                    # stability
-
+        sim = sim - sim_max.detach()
         exp_sim = torch.exp(sim) * (~mask_self).float()
         log_sum = torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-9)
-        log_prob = sim - log_sum                                        # [B, B]
+        log_prob = sim - log_sum
 
         n_pos = mask_pos.float().sum(dim=1).clamp(min=1)
-        loss_per_anchor = -(mask_pos.float() * log_prob).sum(dim=1) / n_pos  # [B]
-
+        loss_per_anchor = -(mask_pos.float() * log_prob).sum(dim=1) / n_pos
         has_pos = mask_pos.any(dim=1)
         return loss_per_anchor[has_pos].mean()
 
 
 # ---------------------------------------------------------------------------
-# 3. WeightedSupConLoss (minority-amplified)
+# 3. WeightedSupConLoss -- minority-amplified, extended with extra_feats pool
 # ---------------------------------------------------------------------------
 
 class WeightedSupConLoss(nn.Module):
     """
-    Weighted Supervised Contrastive Loss.
-
-    Differs from standard SupConLoss in that each anchor gets a weight
-    proportional to the inverse class frequency:
-
-        w_i = 1 / pi_{c_i}     (pi_k = n_k / N)
-
-    Example (MILK10k):
-        MAL_OTH (pi=0.0017) -> raw w ~ 588
-        BCC     (pi=0.48)   -> raw w ~ 2.1
-
-    Weights are normalised so mean(w) = 1 over the batch, then clamped:
-        w_i = clamp(w_i / mean(w), max=weight_clamp)
-
-    With weight_clamp=20.0:
-        MAL_OTH anchor contributes at most 20x more than a BCC anchor.
-
-    Loss:
-        L = sum_i(w_i * L_i) / sum_i(w_i)   (only anchors with >= 1 positive)
-
-    If class_freq=None -> falls back to standard (unweighted) SupConLoss.
-
-    Parameters
-    ----------
-    temperature  : tau for cosine similarity scaling (default 0.07)
-    weight_clamp : max normalised anchor weight (default 20.0).
-                   Set to 0 to disable clamping.
-                   Prevents a bad minority outlier from dominating the step.
+    Weighted SupConLoss. Each anchor weight = 1/pi_k (normalised, clamped).
+    Extended with same extra_feats/extra_labels pool as SupConLoss.
     """
 
     def __init__(self, temperature: float = 0.07, weight_clamp: float = 3.0):
@@ -151,78 +102,60 @@ class WeightedSupConLoss(nn.Module):
 
     def forward(
         self,
-        features:   torch.Tensor,
-        labels:     torch.Tensor,
-        class_freq: torch.Tensor | None = None,
+        features:     torch.Tensor,
+        labels:       torch.Tensor,
+        class_freq:   Optional[torch.Tensor] = None,
+        extra_feats:  Optional[torch.Tensor] = None,
+        extra_labels: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        features   : [B, D]  L2-normalized projected features
-        labels     : [B,]    long class indices
-        class_freq : [C,]    pi_k = n_k/N per class (optional)
-        """
-        B, _ = features.shape
-        device = features.device
+        B, device = features.shape[0], features.device
 
-        # Pairwise cosine similarity
-        sim = torch.matmul(features, features.T) / self.temperature   # [B, B]
+        if extra_feats is not None and extra_feats.size(0) > 0:
+            pool_f = torch.cat([features, extra_feats.to(device)], dim=0)
+            pool_l = torch.cat([labels,   extra_labels.to(device)], dim=0)
+        else:
+            pool_f, pool_l = features, labels
+        N = pool_f.shape[0]
 
-        mask_self  = torch.eye(B, dtype=torch.bool, device=device)
-        labels_col = labels.unsqueeze(1)
-        mask_pos   = (labels_col == labels_col.T) & ~mask_self         # [B, B]
+        sim = torch.matmul(features, pool_f.T) / self.temperature  # [B, N]
+
+        mask_self = torch.zeros(B, N, dtype=torch.bool, device=device)
+        mask_self[:, :B] = torch.eye(B, dtype=torch.bool, device=device)
+        mask_pos = (labels.unsqueeze(1) == pool_l.unsqueeze(0)) & ~mask_self
 
         if mask_pos.sum() == 0:
             return features.sum() * 0.0
 
-        # Per-anchor SupCon loss (same maths as SupConLoss)
         sim_max, _ = sim.max(dim=1, keepdim=True)
         sim = sim - sim_max.detach()
+        exp_sim = torch.exp(sim) * (~mask_self).float()
+        log_sum = torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-9)
+        log_prob = sim - log_sum
 
-        exp_sim  = torch.exp(sim) * (~mask_self).float()
-        log_sum  = torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-9)
-        log_prob = sim - log_sum                                        # [B, B]
-
-        n_pos           = mask_pos.float().sum(dim=1).clamp(min=1)
-        loss_per_anchor = -(mask_pos.float() * log_prob).sum(dim=1) / n_pos  # [B]
-
+        n_pos = mask_pos.float().sum(dim=1).clamp(min=1)
+        loss_per_anchor = -(mask_pos.float() * log_prob).sum(dim=1) / n_pos
         has_pos = mask_pos.any(dim=1)
+
         if has_pos.sum() == 0:
             return features.sum() * 0.0
 
-        # Unweighted fallback
         if class_freq is None:
             return loss_per_anchor[has_pos].mean()
 
-        # Inverse-frequency weights, normalised to mean=1
-        weights = 1.0 / class_freq[labels].clamp(min=1e-9)            # [B]
-        weights = weights / weights.mean()                             # mean -> 1
-        weights = torch.clamp(weights, max=self.weight_clamp)         # cap extremes
-
+        weights = 1.0 / class_freq[labels].clamp(min=1e-9)
+        weights = weights / weights.mean()
+        weights = torch.clamp(weights, max=self.weight_clamp)
         w    = weights[has_pos]
         loss = loss_per_anchor[has_pos]
         return (w * loss).sum() / w.sum()
 
 
 # ---------------------------------------------------------------------------
-# 4. PrototypeLoss
+# 4. PrototypeLoss (unchanged from original BCL)
 # ---------------------------------------------------------------------------
 
 class PrototypeLoss(nn.Module):
-    """
-    Prototype Loss for BCL.
-
-    Maintains an EMA prototype (running centroid) per class.
-    Loss = CE( sim(z, prototypes) / tau,  y )
-
-    Key advantage over SupConLoss: once a prototype for MAL_OTH is initialised
-    from early batches, every subsequent sample gets gradient pulling it toward
-    the MAL_OTH centroid -- even if only 1 MAL_OTH sample appears in the batch.
-
-    Parameters
-    ----------
-    num_classes : number of classes (C)
-    feat_dim    : projection dimension (D)
-    momentum    : EMA coefficient for prototype update (default 0.9)
-    """
+    """EMA prototype per class. Loss = CE(sim(z, protos)/tau, y)."""
 
     def __init__(self, num_classes: int, feat_dim: int, momentum: float = 0.9):
         super().__init__()
@@ -233,7 +166,6 @@ class PrototypeLoss(nn.Module):
 
     @torch.no_grad()
     def update(self, features: torch.Tensor, labels: torch.Tensor) -> None:
-        """EMA update. Call with detached features after each forward pass."""
         for c in range(self.num_classes):
             mask = labels == c
             if mask.sum() == 0:
@@ -246,22 +178,14 @@ class PrototypeLoss(nn.Module):
                 proto = self.momentum * self.prototypes[c] + (1.0 - self.momentum) * feat_c
                 self.prototypes[c]  = F.normalize(proto, dim=0)
 
-    def forward(
-        self,
-        features:    torch.Tensor,
-        labels:      torch.Tensor,
-        temperature: float = 0.07,
-    ) -> torch.Tensor:
-        """
-        Pull each feature toward its class prototype via CE on similarities.
-        Only classes with an initialised prototype contribute.
-        """
+    def forward(self, features: torch.Tensor, labels: torch.Tensor,
+                temperature: float = 0.07) -> torch.Tensor:
         valid = self.initialized
         if valid.sum() < 2:
             return features.sum() * 0.0
 
-        protos        = F.normalize(self.prototypes[valid], dim=1)    # [C', D]
-        valid_classes = torch.where(valid)[0]                          # [C']
+        protos        = F.normalize(self.prototypes[valid], dim=1)
+        valid_classes = torch.where(valid)[0]
 
         class_to_idx = torch.full(
             (self.num_classes,), -1, dtype=torch.long, device=features.device
@@ -275,52 +199,52 @@ class PrototypeLoss(nn.Module):
 
         feat_v = features[has_proto]
         lbl_v  = class_to_idx[labels[has_proto]]
-
-        sim = torch.matmul(feat_v, protos.T) / temperature
+        sim    = torch.matmul(feat_v, protos.T) / temperature
         return F.cross_entropy(sim, lbl_v)
 
 
 # ---------------------------------------------------------------------------
-# 5. BCLLoss -- combined loss
+# 5. BCLLoss -- combined loss with Queue + Feature Augmentation
 # ---------------------------------------------------------------------------
 
 class BCLLoss(nn.Module):
     """
-    Balanced Contrastive Learning Loss (Zhu et al. CVPR 2022).
+    Balanced Contrastive Learning Loss + Queue + Feature-space augmentation.
 
     L_total = L_CE + lambda_sup * L_SupCon + lambda_proto * L_proto
 
-    Usage
-    -----
-        bcl = BCLLoss(num_classes=11, feat_dim=128, ce_criterion=my_ce_loss)
-        loss, info = bcl(logits, proj_feat, targets_onehot)
+    Queue (BPaCo-style):
+      MoCo-style FIFO buffer that stores encoded features from recent batches.
+      SupCon denominator pool = current batch + queue -> minority classes
+      always participate even when absent from current batch.
 
-    Parameters
-    ----------
-    num_classes          : number of output classes
-    feat_dim             : projection head output dimension
-    temperature          : tau for contrastive similarity
-    lambda_sup           : weight for SupCon component
-    lambda_proto         : weight for prototype component
-    proto_momentum       : EMA momentum for prototype update
-    ce_criterion         : external CE/LA/focal loss; None -> l_ce = 0
-    use_weighted_supcon  : if True, use WeightedSupConLoss (w_i = 1/pi_k)
-    class_freq           : [C,] pi_k tensor required when use_weighted_supcon=True
-    supcon_weight_clamp  : max anchor weight in WeightedSupConLoss (default 20.0)
+    Feature augmentation:
+      After feat_aug_warmup epochs, generates virtual features for minority
+      classes: z_aug = alpha*z_real + (1-alpha)*proto + noise.
+      Injected into SupCon pool only (not CE or PrototypeLoss).
     """
 
     def __init__(
         self,
-        num_classes:         int,
-        feat_dim:            int   = 128,
-        temperature:         float = 0.07,
-        lambda_sup:          float = 0.1,
-        lambda_proto:        float = 0.1,
-        proto_momentum:      float = 0.9,
-        ce_criterion:        nn.Module | None = None,
-        use_weighted_supcon: bool  = False,
-        class_freq:          torch.Tensor | None = None,
-        supcon_weight_clamp: float = 20.0,
+        num_classes:              int,
+        feat_dim:                 int   = 128,
+        temperature:              float = 0.07,
+        lambda_sup:               float = 0.1,
+        lambda_proto:             float = 0.1,
+        proto_momentum:           float = 0.9,
+        ce_criterion:             Optional[nn.Module] = None,
+        use_weighted_supcon:      bool  = False,
+        class_freq:               Optional[torch.Tensor] = None,
+        supcon_weight_clamp:      float = 3.0,
+        queue_size:               int   = 0,
+        feat_aug:                 bool  = False,
+        feat_aug_warmup:          int   = 5,
+        feat_aug_minority_thresh: int   = 100,
+        feat_aug_per_sample:      int   = 4,
+        feat_aug_alpha_min:       float = 0.3,
+        feat_aug_alpha_max:       float = 0.7,
+        feat_aug_noise_std:       float = 0.05,
+        class_counts:             Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.lambda_sup          = lambda_sup
@@ -330,16 +254,13 @@ class BCLLoss(nn.Module):
 
         if use_weighted_supcon:
             self.supcon = WeightedSupConLoss(
-                temperature=temperature,
-                weight_clamp=supcon_weight_clamp,
+                temperature=temperature, weight_clamp=supcon_weight_clamp,
             )
         else:
             self.supcon = SupConLoss(temperature=temperature)
 
         self.proto = PrototypeLoss(
-            num_classes=num_classes,
-            feat_dim=feat_dim,
-            momentum=proto_momentum,
+            num_classes=num_classes, feat_dim=feat_dim, momentum=proto_momentum,
         )
         self.ce = ce_criterion
 
@@ -348,45 +269,172 @@ class BCLLoss(nn.Module):
         else:
             self.class_freq = None
 
+        # Queue
+        self.queue_size = queue_size
+        if queue_size > 0:
+            self.register_buffer(
+                "_qf", F.normalize(torch.randn(queue_size, feat_dim), dim=1),
+            )
+            self.register_buffer(
+                "_ql", torch.full((queue_size,), -1, dtype=torch.long),
+            )
+            self.register_buffer("_qptr", torch.zeros(1, dtype=torch.long))
+        self._qvalid = 0  # not a buffer; resets on reload (queue refills fast)
+
+        # Feature augmentation
+        self.feat_aug                 = feat_aug
+        self.feat_aug_warmup          = feat_aug_warmup
+        self.feat_aug_minority_thresh = feat_aug_minority_thresh
+        self.feat_aug_per_sample      = feat_aug_per_sample
+        self.feat_aug_alpha_min       = feat_aug_alpha_min
+        self.feat_aug_alpha_max       = feat_aug_alpha_max
+        self.feat_aug_noise_std       = feat_aug_noise_std
+
+        if class_counts is not None:
+            self.register_buffer("class_counts", class_counts.float())
+        else:
+            self.class_counts = None
+
+    # -- Queue helpers --
+
+    @torch.no_grad()
+    def _enqueue(self, feats: torch.Tensor, labels: torch.Tensor) -> None:
+        if self.queue_size == 0:
+            return
+        B   = feats.size(0)
+        ptr = int(self._qptr)
+        end = ptr + B
+        if end <= self.queue_size:
+            self._qf[ptr:end] = feats
+            self._ql[ptr:end] = labels
+        else:
+            part1 = self.queue_size - ptr
+            self._qf[ptr:]       = feats[:part1]
+            self._ql[ptr:]       = labels[:part1]
+            self._qf[:B - part1] = feats[part1:]
+            self._ql[:B - part1] = labels[part1:]
+        self._qptr[0] = (ptr + B) % self.queue_size
+        self._qvalid  = min(self._qvalid + B, self.queue_size)
+
+    def _get_queue(self):
+        if self.queue_size == 0 or self._qvalid == 0:
+            return None, None
+        n = self._qvalid
+        return self._qf[:n].clone(), self._ql[:n].clone()
+
+    # -- Feature augmentation helper --
+
+    @torch.no_grad()
+    def _augment_features(self, feats_det: torch.Tensor, labels: torch.Tensor):
+        if self.class_counts is None:
+            return None, None
+        aug_list, lbl_list = [], []
+        device = feats_det.device
+        for c in range(self.proto.num_classes):
+            if not self.proto.initialized[c]:
+                continue
+            if self.class_counts[c] > self.feat_aug_minority_thresh:
+                continue
+            mask = labels == c
+            if mask.sum() == 0:
+                continue
+            real_feats = feats_det[mask]
+            proto_c    = F.normalize(self.proto.prototypes[c].detach(), dim=0)
+            for _ in range(self.feat_aug_per_sample):
+                for rf in real_feats:
+                    alpha = random.uniform(self.feat_aug_alpha_min, self.feat_aug_alpha_max)
+                    z = alpha * rf + (1.0 - alpha) * proto_c
+                    noise = torch.randn_like(z) * self.feat_aug_noise_std
+                    z = F.normalize(z + noise, dim=0)
+                    aug_list.append(z)
+                    lbl_list.append(c)
+        if not aug_list:
+            return None, None
+        aug_t = torch.stack(aug_list).to(device)
+        lbl_t = torch.tensor(lbl_list, dtype=torch.long, device=device)
+        return aug_t, lbl_t
+
+    # -- Main forward --
+
     def forward(
         self,
         logits:    torch.Tensor,
         proj_feat: torch.Tensor,
         targets:   torch.Tensor,
+        epoch:     int = 0,
     ):
         """
         logits    : [B, C]  raw classification logits
         proj_feat : [B, D]  L2-normalized projected features
         targets   : [B, C]  one-hot  OR  [B,] long class indices
-
-        Returns
-        -------
-        total_loss : scalar
-        info       : dict with per-component loss values (for logging)
+        epoch     : int     current epoch (gate for feat_aug warmup)
+        Returns   : (total_loss, info_dict)
         """
         labels = targets.argmax(dim=1) if targets.dim() == 2 else targets.long()
 
-        # Classification loss
+        # 1. CE loss
         l_ce = (
-            self.ce(logits, targets)
-            if self.ce is not None
+            self.ce(logits, targets) if self.ce is not None
             else torch.tensor(0.0, device=logits.device)
         )
 
-        # Supervised contrastive loss
-        if self.use_weighted_supcon:
-            l_sup = self.supcon(proj_feat, labels, class_freq=self.class_freq)
-        else:
-            l_sup = self.supcon(proj_feat, labels)
-
-        # Prototype loss + EMA update
+        # 2. Update prototypes first (aug uses them)
         self.proto.update(proj_feat.detach(), labels)
+
+        # 3. Feature augmentation (minority, after warmup)
+        aug_feats, aug_labels = None, None
+        if (self.feat_aug and epoch >= self.feat_aug_warmup
+                and self.proto.initialized.any()):
+            aug_feats, aug_labels = self._augment_features(proj_feat.detach(), labels)
+
+        # 4. Queue features
+        q_feats, q_labels = self._get_queue()
+
+        # 5. Build extra pool: aug + valid-queue entries
+        parts_f, parts_l = [], []
+        if aug_feats is not None:
+            parts_f.append(aug_feats)
+            parts_l.append(aug_labels)
+        if q_feats is not None:
+            valid_q = q_labels >= 0
+            if valid_q.any():
+                parts_f.append(q_feats[valid_q])
+                parts_l.append(q_labels[valid_q])
+
+        extra_f = torch.cat(parts_f, dim=0) if parts_f else None
+        extra_l = torch.cat(parts_l, dim=0) if parts_l else None
+
+        # 6. SupCon loss (with extended pool)
+        if self.use_weighted_supcon:
+            l_sup = self.supcon(
+                proj_feat, labels,
+                class_freq=self.class_freq,
+                extra_feats=extra_f, extra_labels=extra_l,
+            )
+        else:
+            l_sup = self.supcon(
+                proj_feat, labels,
+                extra_feats=extra_f, extra_labels=extra_l,
+            )
+
+        # 7. Proto loss (real features only)
         l_proto = self.proto(proj_feat, labels, temperature=self.temperature)
 
+        # 8. Enqueue AFTER loss (MoCo convention)
+        if self.queue_size > 0:
+            self._enqueue(proj_feat.detach(), labels)
+
+        # 9. Total
         total = l_ce + self.lambda_sup * l_sup + self.lambda_proto * l_proto
 
-        return total, {
+        info = {
             "l_ce":    l_ce.item(),
             "l_sup":   l_sup.item(),
             "l_proto": l_proto.item(),
         }
+        if aug_feats is not None:
+            info["n_aug"] = aug_feats.size(0)
+        if q_feats is not None:
+            info["q_size"] = self._qvalid
+
+        return total, info

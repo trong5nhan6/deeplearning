@@ -39,7 +39,7 @@ test_image_dir:  "datasets/MILK10k/test/MILK10k_Test_Input"
 image_dir: "datasets/MILK10k/train/MILK10k_Training_Input"
 
 # ── Training ───────────────────────────────────────────────────────────────────
-epochs:      30
+epochs:      40
 batch_size:  16             # nhỏ hơn các model khác vì dual encoder + cross-attn
 num_workers: 4
 seed:        42
@@ -64,7 +64,7 @@ clip_grad: 1.0
 #   logit_adjustment   → LA loss (Menon 2021), requires la_tau
 #   ldam               → LDAM loss (Cao 2019), can combine with DRW via scheduler
 #   ldam_drw           → LDAM + deferred re-weighting (turn on class_weight at epoch drw_start)
-loss_name:       "bce"
+loss_name:       "logit_adjustment"
 label_smoothing: 0.1
 
 # Logit Adjustment params
@@ -124,6 +124,27 @@ bcl_weighted_supcon: true
 # 3.0 = MAL_OTH anchor đóng góp tối đa 3× BCC (conservative, stable)
 bcl_supcon_weight_clamp: 3.0
 
+# ── Queue-based contrastive (BPaCo-style) ─────────────────────────────────────
+# MoCo-style FIFO queue so minority classes (MAL_OTH=8 samples) are always
+# represented in SupCon denominator, regardless of batch content.
+# With batch=16 → queue fills in 4096/16=256 steps ≈ 0.8 epochs.
+# 0 = disabled; 4096 = recommended
+bcl_queue_size:      4096
+
+# ── Feature-space augmentation for minority classes ────────────────────────────
+# Generate virtual features: z_aug = α·z_real + (1-α)·proto + ε
+# Only active after feat_aug_warmup epochs (prototype must be stable).
+# Virtual features injected into SupConLoss only (not CE or PrototypeLoss).
+# Classes with n_k ≤ minority_thresh samples are augmented.
+# With per_sample=4 and 8 MAL_OTH real → 32 virtual → 40 total positives.
+bcl_feat_aug:                 true
+bcl_feat_aug_warmup:          5       # epochs to wait before augmenting
+bcl_feat_aug_minority_thresh: 100     # n_k threshold (captures MAL_OTH=8, BEN_OTH, INF...)
+bcl_feat_aug_per_sample:      4       # virtual features per real sample per class
+bcl_feat_aug_alpha_min:       0.3     # interpolation range toward prototype
+bcl_feat_aug_alpha_max:       0.7
+bcl_feat_aug_noise_std:       0.05   # Gaussian noise std (unit sphere perturbation)
+
 # ── cRT (Classifier Re-Training) — Kang et al. ICLR 2020 ──────────────────────
 # Stage 1: train bình thường (code chạy đến đây như cũ)
 # Stage 2: freeze backbone, retrain classifier với class-balanced sampler
@@ -132,7 +153,7 @@ bcl_supcon_weight_clamp: 3.0
 # crt_epochs    : số epoch stage 2 (10-15 là đủ vì chỉ train head)
 # crt_lr        : lr nhỏ hơn stage 1 (head đã có feature tốt, chỉ cần fine-tune boundary)
 # crt_batch_size: batch cho stage 2 (có thể tăng vì không cần full forward qua backbone)
-use_crt:          true
+use_crt:          false
 crt_epochs:       12
 crt_lr:           5.0e-5
 crt_batch_size:   32
