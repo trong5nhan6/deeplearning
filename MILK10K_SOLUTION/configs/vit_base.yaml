@@ -72,6 +72,15 @@ asl_clip:        0.05
 # ── Sampler ────────────────────────────────────────────────────────────────────
 use_weighted_sampler: false
 
+# ── BCL (Balanced Contrastive Learning) — Zhu et al. CVPR 2022 ───────────────
+use_bcl:             false   # set true to enable contrastive training
+bcl_proj_hidden:     256
+bcl_proj_dim:        128
+bcl_temperature:     0.07
+bcl_lambda_sup:      0.1
+bcl_lambda_proto:    0.1
+bcl_proto_momentum:  0.9
+
 # ── cRT (Classifier Re-Training) — Kang et al. ICLR 2020 ──────────────────────
 use_crt:          false
 crt_epochs:       10

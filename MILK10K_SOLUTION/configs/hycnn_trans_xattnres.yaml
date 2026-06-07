@@ -64,11 +64,18 @@ clip_grad: 1.0
 #   logit_adjustment   → LA loss (Menon 2021), requires la_tau
 #   ldam               → LDAM loss (Cao 2019), can combine with DRW via scheduler
 #   ldam_drw           → LDAM + deferred re-weighting (turn on class_weight at epoch drw_start)
-loss_name:       "logit_adjustment"
+loss_name:       "bce"
 label_smoothing: 0.1
 
 # Logit Adjustment params
-la_tau:          1.0          # τ: scale factor for log-prior adjustment (1.0 = full adjustment)
+la_tau:          0.5          # τ: scale factor for log-prior adjustment
+                              # 1.0 = full adjustment (overcorrects at IR=280×)
+                              # 0.5 = partial adjustment (more stable empirically)
+
+# Per-sample loss clamp — ngăn sample outlier/mislabeled dominate training
+# max CE cho 11 class = log(11) ≈ 2.4; clamp=4.0 cho 65% headroom trước khi clip
+# 0.0 = tắt (không clamp)
+loss_clamp:      4.0
 
 # LDAM params (dùng khi loss_name = ldam / ldam_drw)
 ldam_c:          0.5          # C trong margin = C / n_k^(1/4)
@@ -76,11 +83,46 @@ drw_start:       10           # epoch bắt đầu deferred re-weighting (chỉ 
 
 # Class weight params (dùng khi loss cần class_weight: focal_softmax, ldam, ldam_drw)
 class_weight_mode: "effective"   # effective | inv_sqrt | inv_freq
-class_weight_clip: 50.0
+class_weight_clip: 10.0       # giảm từ 50 → 10: tránh gradient explosion cho MAL_OTH
 class_weight_beta: 0.9999
+# weight_clamp: torch.clamp(weights, max=weight_clamp) bên trong forward() của mỗi loss
+# Đây là safety net thứ 2 sau class_weight_clip (numpy-level).
+# 0.0 = tắt; 3.0 = minority class đóng góp tối đa 3× majority (conservative)
+weight_clamp:      3.0
 
 # ── Sampler ────────────────────────────────────────────────────────────────────
 use_weighted_sampler: true
+
+# ── BCL (Balanced Contrastive Learning) — Zhu et al. CVPR 2022 ───────────────
+# L_total = L_CE + λ_sup · L_SupCon + λ_proto · L_proto
+#
+# use_bcl: true  → kích hoạt projection head + SupCon + Prototype loss
+# bcl_feat_in_dim: chiều feature trước head (= attn_dim cho HyCNN-Trans)
+# bcl_proj_hidden: hidden dim của projection MLP
+# bcl_proj_dim   : output dim của projection head (contrastive space)
+# bcl_temperature: τ cho cosine similarity (0.07 = default SupCon)
+# bcl_lambda_sup : trọng số L_SupCon (0.1 = bắt đầu nhẹ)
+# bcl_lambda_proto: trọng số L_proto (0.1 = bắt đầu nhẹ)
+# bcl_proto_momentum: EMA momentum cho prototype update (0.9)
+# bcl_proj_lr    : lr của proj_head optimizer (mặc định = lr)
+use_bcl:             true
+bcl_feat_in_dim:     768    # = attn_dim của HyCNN-Trans
+bcl_proj_hidden:     256
+bcl_proj_dim:        128
+bcl_temperature:     0.07
+bcl_lambda_sup:      0.1
+bcl_lambda_proto:    0.1
+bcl_proto_momentum:  0.9
+bcl_proj_lr:         3.0e-5
+# Weighted SupCon: weight mỗi anchor theo 1/π_k (minority class được tính nhiều hơn)
+# false = SupCon chuẩn; true = WeightedSupCon (khuyến nghị khi IR > 100×)
+bcl_weighted_supcon: true
+# weight_clamp cho WeightedSupConLoss:
+#   weights = 1 / pi_k          → inverse class freq
+#   weights = weights / mean     → normalize mean=1
+#   weights = clamp(weights, max=bcl_supcon_weight_clamp)
+# 3.0 = MAL_OTH anchor đóng góp tối đa 3× BCC (conservative, stable)
+bcl_supcon_weight_clamp: 3.0
 
 # ── cRT (Classifier Re-Training) — Kang et al. ICLR 2020 ──────────────────────
 # Stage 1: train bình thường (code chạy đến đây như cũ)

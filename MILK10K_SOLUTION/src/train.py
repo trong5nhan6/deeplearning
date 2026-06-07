@@ -22,9 +22,15 @@ from src.utils import (
     save_checkpoint, set_seed, setup_logger,
 )
 from src.validate import _forward, collect_outputs, validate_epoch
+from src.visualize import (
+    log_class_weights_table,
+    log_confusion_matrix,
+    visualize_embeddings,
+)
 
 
-def _log_final_summary(model, val_loader, device, threshold, use_amp, logger, cfg, ckpt_dir):
+def _log_final_summary(model, val_loader, device, threshold, use_amp, logger, cfg, ckpt_dir,
+                        log_dir=None):
     """Load best weights, run final val pass, log comprehensive metrics and model info."""
     from src.metrics import compute_full_summary
     from src.utils import load_checkpoint
@@ -68,6 +74,9 @@ def _log_final_summary(model, val_loader, device, threshold, use_amp, logger, cf
         logger.info(f"  GFLOPs     : {gflops:.2f}")
     logger.info(f"  Params (M) : {params_m:.2f}")
     logger.info("=" * 50)
+
+    # ── Confusion matrix ─────────────────────────────────────────────────────
+    log_confusion_matrix(logits_np, labels_np, logger)
 
 
 def _auto_submit(model, cfg, device, use_amp, ckpt_dir, meta_processor, logger):
@@ -180,18 +189,25 @@ def _build_balanced_sampler(train_ds) -> WeightedRandomSampler:
     )
 
 
-def _run_crt_stage2(model, train_ds, val_loader, criterion, cfg, device,
+def _run_crt_stage2(model, train_ds, val_loader, cfg, device,
                     ckpt_dir: str, log_dir: Path, logger) -> float:
     """
     cRT Stage 2 — Kang et al. ICLR 2020.
 
     1. Load best stage-1 checkpoint.
     2. Freeze backbone; only classifier head is trainable.
-    3. Train with class-balanced sampler for crt_epochs.
+    3. Train with class-balanced sampler + plain CrossEntropy for crt_epochs.
     4. Save best_crt.pth and last_crt.pth.
+
+    WHY plain CE (not LA loss):
+    - LA loss adjusts logits based on the original long-tail prior (BCC=48%, MAL_OTH=0.17%)
+    - Balanced sampler already equalises class distribution (~9% each)
+    - Using LA loss on top of balanced sampling double-corrects → overcorrects in wrong direction
+    - Plain CE + balanced sampler is what the original cRT paper uses
 
     Returns best val macro-F1 achieved in stage 2.
     """
+    from src.losses import SoftmaxCrossEntropyLoss
     from src.utils import load_checkpoint
 
     # ── load stage-1 best weights ────────────────────────────────────────────
@@ -203,11 +219,21 @@ def _run_crt_stage2(model, train_ds, val_loader, criterion, cfg, device,
         logger.warning("[cRT] best.pth not found — using current weights for stage 2")
 
     # ── freeze backbone ──────────────────────────────────────────────────────
-    head_names = _get_head_names(model)
-    n_frozen   = _freeze_backbone(model, head_names)
+    head_names  = _get_head_names(model)
+    n_frozen    = _freeze_backbone(model, head_names)
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"[cRT] Frozen {n_frozen/1e6:.2f}M params | "
                 f"Trainable {n_trainable/1e6:.2f}M params | head={head_names}")
+
+    # ── cRT criterion: plain CrossEntropy (balanced sampler handles class dist)
+    # Không dùng LA loss / focal ở đây — balanced sampler đã equalize rồi,
+    # thêm LA loss sẽ double-correct và gây loss scale explosion (loss ~3.5 vs 0.9)
+    crt_label_smoothing = cfg.get("crt_label_smoothing", cfg.get("label_smoothing", 0.1))
+    crt_criterion = SoftmaxCrossEntropyLoss(
+        label_smoothing=crt_label_smoothing,
+        weight=None,   # không dùng class weight, balanced sampler đã lo
+    ).to(device)
+    logger.info(f"[cRT] criterion=CrossEntropy  label_smoothing={crt_label_smoothing}")
 
     # ── class-balanced dataloader ────────────────────────────────────────────
     crt_bs     = cfg.get("crt_batch_size", cfg.get("batch_size", 32))
@@ -239,10 +265,10 @@ def _run_crt_stage2(model, train_ds, val_loader, criterion, cfg, device,
         eta_min=cfg.get("eta_min", 1e-7),
     )
 
-    use_amp   = cfg.get("use_amp", True) and torch.cuda.is_available()
-    scaler    = torch.amp.GradScaler("cuda", enabled=use_amp)
-    clip_grad = cfg.get("clip_grad", 1.0)
-    threshold = cfg.get("threshold", 0.5)
+    use_amp    = cfg.get("use_amp", True) and torch.cuda.is_available()
+    scaler     = torch.amp.GradScaler("cuda", enabled=use_amp)
+    clip_grad  = cfg.get("clip_grad", 1.0)
+    threshold  = cfg.get("threshold", 0.5)
     model_name = cfg.get("model_name", "model")
 
     csv_log = CSVLogger(
@@ -258,11 +284,11 @@ def _run_crt_stage2(model, train_ds, val_loader, criterion, cfg, device,
 
     for epoch in range(1, crt_epochs + 1):
         train_loss, train_acc, train_f1 = train_epoch(
-            model, bal_loader, criterion, optimizer,
+            model, bal_loader, crt_criterion, optimizer,
             scaler, device, clip_grad, use_amp, threshold,
         )
         val_loss, mf1, pc_f1, val_acc = validate_epoch(
-            model, val_loader, criterion, device,
+            model, val_loader, crt_criterion, device,
             threshold=threshold, use_amp=use_amp,
         )
         scheduler.step()
@@ -310,6 +336,177 @@ def _run_crt_stage2(model, train_ds, val_loader, criterion, cfg, device,
     _unfreeze_all(model)
     logger.info(f"[cRT] Stage 2 done  best_crt_f1={best_f1:.4f}")
     return best_f1
+
+
+# ── BCL (Balanced Contrastive Learning) helpers ───────────────────────────────
+
+def _setup_bcl(model: nn.Module, cfg: dict, train_ds, device, criterion):
+    """
+    Attach a ProjectionHead to the model via a forward hook on the classifier layer.
+
+    Strategy:
+    - HyCNN-Trans models: hook on model.head (Linear after head_norm) → input = feature [B, attn_dim]
+    - Single-branch models: hook on first Linear inside model.classifier → input = backbone feature
+
+    The hook stores features in feat_store["feat"] every forward pass,
+    which train_epoch_bcl reads to build projected embeddings.
+
+    Returns:
+        proj_head    : ProjectionHead module (on device)
+        bcl_criterion: BCLLoss module (on device)
+        hook_handle  : RemovableHandle — call .remove() when done
+        feat_store   : dict mutated in-place by the hook
+    """
+    from src.bcl import ProjectionHead, BCLLoss
+
+    feat_store: dict = {}
+
+    # ── find the linear layer to hook ────────────────────────────────────────
+    hook_target = None
+    # Priority: model.head (HyCNN) → model.classifier → model.fc
+    for attr in ("head", "classifier", "fc"):
+        if not hasattr(model, attr):
+            continue
+        mod = getattr(model, attr)
+        if isinstance(mod, nn.Linear):
+            hook_target = mod
+            break
+        elif isinstance(mod, nn.Sequential):
+            # Hook the first Linear sub-module (feature enters before it)
+            for sub in mod.modules():
+                if isinstance(sub, nn.Linear):
+                    hook_target = sub
+                    break
+            if hook_target is not None:
+                break
+
+    if hook_target is None:
+        raise RuntimeError(
+            "[BCL] Cannot find a Linear head to hook for feature extraction. "
+            "Expected model.head, model.classifier, or model.fc."
+        )
+
+    def _hook_fn(module, inp, out):
+        # inp is a tuple; inp[0] is the tensor entering the Linear layer
+        feat_store["feat"] = inp[0]
+
+    hook_handle = hook_target.register_forward_hook(_hook_fn)
+
+    # ── detect feature dim via probe forward ──────────────────────────────────
+    feat_in_dim = cfg.get("bcl_feat_in_dim") or cfg.get("attn_dim") or cfg.get("embed_dim")
+    if feat_in_dim is None:
+        from torch.utils.data import DataLoader as _DL
+        probe_loader = _DL(train_ds, batch_size=2, shuffle=True,
+                           num_workers=0, drop_last=False)
+        model.eval()
+        with torch.no_grad():
+            probe_batch = next(iter(probe_loader))
+            _forward(model, probe_batch, device)
+        feat_in_dim = feat_store["feat"].shape[-1]
+        model.train()
+
+    proj_hidden = cfg.get("bcl_proj_hidden", 256)
+    proj_dim    = cfg.get("bcl_proj_dim",    128)
+
+    proj_head = ProjectionHead(
+        in_dim=feat_in_dim, hidden_dim=proj_hidden, out_dim=proj_dim
+    ).to(device)
+
+    # Compute class_freq for WeightedSupConLoss
+    bcl_class_freq = None
+    if cfg.get("bcl_weighted_supcon", False):
+        from src.losses import compute_class_freq
+        from src.metrics import LABEL_COLS as _LC
+        if all(c in train_ds.df.columns for c in _LC):
+            _lbl = train_ds.df[_LC].values.astype(float)
+            bcl_class_freq = compute_class_freq(_lbl).to(device)
+
+    bcl_criterion = BCLLoss(
+        num_classes=cfg.get("num_classes", 11),
+        feat_dim=proj_dim,
+        temperature=cfg.get("bcl_temperature",       0.07),
+        lambda_sup=cfg.get("bcl_lambda_sup",         0.1),
+        lambda_proto=cfg.get("bcl_lambda_proto",     0.1),
+        proto_momentum=cfg.get("bcl_proto_momentum", 0.9),
+        ce_criterion=criterion,
+        use_weighted_supcon=cfg.get("bcl_weighted_supcon",       False),
+        class_freq=bcl_class_freq,
+        supcon_weight_clamp=cfg.get("bcl_supcon_weight_clamp",  20.0),
+    ).to(device)
+
+    return proj_head, bcl_criterion, hook_handle, feat_store
+
+
+def train_epoch_bcl(
+    model, proj_head, loader, bcl_criterion, feat_store,
+    optimizer, proj_optimizer, scaler, device,
+    clip_grad=1.0, use_amp=True, threshold=0.5,
+):
+    """
+    Training epoch for BCL.
+
+    Each step:
+      1. model forward (hook captures backbone features into feat_store)
+      2. proj_head(feat) → L2-normalized projected embeddings
+      3. BCLLoss(logits, proj_feat, labels) = L_CE + λ₁·L_SupCon + λ₂·L_proto
+      4. Backward through both model and proj_head
+
+    Two separate optimizers share one AMP scaler; scaler.update() is called
+    once per step after both .step() calls.
+    """
+    model.train()
+    proj_head.train()
+
+    loss_meter = AverageMeter("train_loss")
+    all_logits: list = []
+    all_labels: list = []
+
+    pbar = tqdm(loader, desc="  BCL Train", leave=False, dynamic_ncols=True)
+    for batch in pbar:
+        labels = batch.get("labels")
+        if labels is None:
+            continue
+        labels = labels.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        proj_optimizer.zero_grad(set_to_none=True)
+
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            logits    = _forward(model, batch, device)          # populates feat_store
+            feat      = feat_store.get("feat")
+            if feat is None:
+                raise RuntimeError("[BCL] Forward hook did not capture features. "
+                                   "Check that _setup_bcl found the correct layer.")
+            proj_feat = proj_head(feat)                          # [B, proj_dim] normalized
+            loss, loss_dict = bcl_criterion(logits, proj_feat, labels)
+
+        scaler.scale(loss).backward()
+
+        if clip_grad > 0:
+            scaler.unscale_(optimizer)
+            scaler.unscale_(proj_optimizer)
+            all_p = list(model.parameters()) + list(proj_head.parameters())
+            nn.utils.clip_grad_norm_(all_p, clip_grad)
+
+        scaler.step(optimizer)
+        scaler.step(proj_optimizer)
+        scaler.update()
+
+        loss_meter.update(loss.item(), n=labels.size(0))
+        all_logits.append(logits.detach().cpu())
+        all_labels.append(labels.detach().cpu())
+        pbar.set_postfix({
+            "loss":    f"{loss_meter.avg:.4f}",
+            "l_ce":    f"{loss_dict['l_ce']:.3f}",
+            "l_sup":   f"{loss_dict['l_sup']:.3f}",
+            "l_proto": f"{loss_dict['l_proto']:.3f}",
+        })
+
+    logits_np, labels_np = concat_outputs(all_logits, all_labels)
+    metrics   = compute_metrics(logits_np, labels_np, threshold=threshold)
+    train_acc = float(metrics.get("accuracy", 0.0))
+    train_f1  = float(metrics.get("macro_f1", 0.0))
+    return loss_meter.avg, train_acc, train_f1
 
 
 # ── Training loop ─────────────────────────────────────────────────────────────
@@ -474,6 +671,17 @@ def train(cfg, model):
             class_counts = torch.tensor(counts_np, dtype=torch.float32).to(device)
             logger.info(f"  class_counts: {[int(x) for x in counts_np.tolist()]}")
 
+    # ── Log class weight table before training ───────────────────────────────
+    if all(c in train_ds.df.columns for c in LABEL_COLS):
+        log_class_weights_table(
+            labels_np=train_ds.df[LABEL_COLS].values.astype(float),
+            class_weight=class_weight,
+            pos_weight=pos_weight,
+            class_freq=class_freq,
+            weight_clamp=cfg.get("weight_clamp", 0.0),
+            logger=logger,
+        )
+
     loss_kwargs = {k: v for k, v in cfg.items() if k != "loss_name"}
     criterion = get_loss(
         loss_name,
@@ -500,6 +708,33 @@ def train(cfg, model):
     use_amp = cfg.get("use_amp", True) and torch.cuda.is_available()
     scaler  = torch.amp.GradScaler("cuda", enabled=use_amp)
 
+    # ── BCL setup (optional) ─────────────────────────────────────────────────
+    use_bcl        = cfg.get("use_bcl", False)
+    proj_head      = None
+    bcl_criterion  = None
+    bcl_hook       = None
+    feat_store     = None
+    proj_optimizer = None
+
+    if use_bcl:
+        proj_head, bcl_criterion, bcl_hook, feat_store = _setup_bcl(
+            model, cfg, train_ds, device, criterion
+        )
+        proj_lr        = cfg.get("bcl_proj_lr", cfg.get("lr", 1e-4))
+        proj_optimizer = torch.optim.AdamW(
+            proj_head.parameters(),
+            lr=proj_lr,
+            weight_decay=cfg.get("weight_decay", 1e-4),
+        )
+        proj_dim = cfg.get("bcl_proj_dim", 128)
+        logger.info(
+            f"[BCL] enabled  proj_dim={proj_dim}"
+            f"  λ_sup={cfg.get('bcl_lambda_sup',0.1)}"
+            f"  λ_proto={cfg.get('bcl_lambda_proto',0.1)}"
+            f"  τ={cfg.get('bcl_temperature',0.07)}"
+            f"  proj_lr={proj_lr:.1e}"
+        )
+
     early_stop = EarlyStopping(patience=cfg.get("early_stopping_patience", 10), mode="max")
     csv_log = CSVLogger(
         path=str(log_dir / f"{model_name}_train_log.csv"),
@@ -517,11 +752,18 @@ def train(cfg, model):
     logger.info(f"{'Epoch':>10}  {'Loss tr/val':>14}  {'Acc tr/val':>12}  {'F1 tr/val':>12}  LR")
 
     for epoch in range(1, epochs + 1):
-        train_loss, train_acc, train_f1 = train_epoch(
-            model, train_loader, criterion, optimizer,
-            scaler, device, clip_grad, use_amp, threshold,
-            mixup_alpha=cfg.get("mixup_alpha", 0.0),
-        )
+        if use_bcl:
+            train_loss, train_acc, train_f1 = train_epoch_bcl(
+                model, proj_head, train_loader, bcl_criterion, feat_store,
+                optimizer, proj_optimizer, scaler, device,
+                clip_grad, use_amp, threshold,
+            )
+        else:
+            train_loss, train_acc, train_f1 = train_epoch(
+                model, train_loader, criterion, optimizer,
+                scaler, device, clip_grad, use_amp, threshold,
+                mixup_alpha=cfg.get("mixup_alpha", 0.0),
+            )
         val_loss, mf1, pc_f1, val_acc = validate_epoch(
             model, val_loader, criterion, device,
             threshold=threshold, use_amp=use_amp,
@@ -583,11 +825,16 @@ def train(cfg, model):
             logger.info(f"Early stopping at epoch {epoch}")
             break
 
+    # ── BCL cleanup ──────────────────────────────────────────────────────────
+    if use_bcl and bcl_hook is not None:
+        bcl_hook.remove()
+        logger.info("[BCL] Feature hook removed after stage 1.")
+
     # ── Stage 2: cRT (optional) ──────────────────────────────────────────────
     if cfg.get("use_crt", False):
         import shutil
         crt_f1 = _run_crt_stage2(
-            model, train_ds, val_loader, criterion, cfg, device,
+            model, train_ds, val_loader, cfg, device,
             str(ckpt_dir), log_dir, logger,
         )
         # Nếu cRT cải thiện F1, dùng best_crt.pth làm best.pth chính thức
@@ -605,7 +852,38 @@ def train(cfg, model):
                 " — keeping original best.pth"
             )
 
-    _log_final_summary(model, val_loader, device, threshold, use_amp, logger, cfg, str(ckpt_dir))
+    _log_final_summary(model, val_loader, device, threshold, use_amp, logger, cfg,
+                       str(ckpt_dir), log_dir=log_dir)
+
+    # ── Embedding visualization ──────────────────────────────────────────────
+    try:
+        # Prototypes from BCL (if available)
+        _prototypes = None
+        _proto_init = None
+        if use_bcl and bcl_criterion is not None:
+            _prototypes = bcl_criterion.proto.prototypes
+            _proto_init = bcl_criterion.proto.initialized
+
+        viz_title = (
+            "BCL Embedding Space — contrastive projection (val set)"
+            if use_bcl else
+            "Backbone Embedding Space (val set)"
+        )
+        visualize_embeddings(
+            model=model,
+            val_loader=val_loader,
+            device=device,
+            save_path=str(log_dir / f"{model_name}_embeddings.png"),
+            proj_head=proj_head,       # None if not BCL
+            prototypes=_prototypes,
+            proto_init=_proto_init,
+            use_amp=use_amp,
+            title=viz_title,
+            logger=logger,
+        )
+    except Exception as e:
+        logger.warning(f"[VIZ] Embedding visualization failed: {e}")
+
     _auto_submit(model, cfg, device, use_amp, str(ckpt_dir), meta_processor, logger)
     logger.info(f"Done  best_val_f1={best_f1:.4f}  total_time={timer.elapsed()}")
     return best_f1

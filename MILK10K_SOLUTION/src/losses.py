@@ -33,15 +33,26 @@ class WeightedBCEWithLogitsLoss(nn.Module):
         criterion  = WeightedBCEWithLogitsLoss(pos_weight=pos_weight)
     """
 
-    def __init__(self, pos_weight: Optional[torch.Tensor] = None, reduction: str = "mean"):
+    def __init__(
+        self,
+        pos_weight:  Optional[torch.Tensor] = None,
+        reduction:   str   = "mean",
+        weight_clamp: float = 0.0,
+    ):
         super().__init__()
         self.register_buffer("pos_weight", pos_weight)
-        self.reduction = reduction
+        self.reduction    = reduction
+        self.weight_clamp = weight_clamp
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        pos_weight = (
+            torch.clamp(self.pos_weight, max=self.weight_clamp)
+            if (self.pos_weight is not None and self.weight_clamp > 0)
+            else self.pos_weight
+        )
         return F.binary_cross_entropy_with_logits(
             logits, targets,
-            pos_weight=self.pos_weight,
+            pos_weight=pos_weight,
             reduction=self.reduction,
         )
 
@@ -106,25 +117,41 @@ class SoftmaxCrossEntropyLoss(nn.Module):
 
     label_smoothing : label smoothing factor (0.0 = off)
     weight          : optional per-class weight tensor of shape (C,)
+    loss_clamp      : if > 0, clamp per-sample loss to this max before averaging.
+                      Prevents extreme-imbalance outliers from dominating a step.
+                      Sensible value: log(C) * 2  (e.g. 4.0 for C=11 → log(11)≈2.4)
     """
 
     def __init__(
         self,
         label_smoothing: float = 0.0,
-        weight: Optional[torch.Tensor] = None,
+        weight:          Optional[torch.Tensor] = None,
+        loss_clamp:      float = 0.0,
+        weight_clamp:    float = 0.0,
     ):
         super().__init__()
         self.label_smoothing = label_smoothing
+        self.loss_clamp      = loss_clamp
+        self.weight_clamp    = weight_clamp
         self.register_buffer("weight", weight)
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         if targets.dim() == 2:
             targets = targets.argmax(dim=1)
-        return F.cross_entropy(
-            logits, targets,
-            weight=self.weight,
-            label_smoothing=self.label_smoothing,
+        weight = (
+            torch.clamp(self.weight, max=self.weight_clamp)
+            if (self.weight is not None and self.weight_clamp > 0)
+            else self.weight
         )
+        loss = F.cross_entropy(
+            logits, targets,
+            weight=weight,
+            label_smoothing=self.label_smoothing,
+            reduction="none" if self.loss_clamp > 0 else "mean",
+        )
+        if self.loss_clamp > 0:
+            loss = loss.clamp(max=self.loss_clamp).mean()
+        return loss
 
 
 # ── 4. Softmax Focal Loss ────────────────────────────────────────────────────
@@ -145,13 +172,15 @@ class SoftmaxFocalLoss(nn.Module):
 
     def __init__(
         self,
-        gamma: float = 2.0,
+        gamma:           float = 2.0,
         label_smoothing: float = 0.0,
-        weight: Optional[torch.Tensor] = None,
+        weight:          Optional[torch.Tensor] = None,
+        weight_clamp:    float = 0.0,
     ):
         super().__init__()
         self.gamma           = gamma
         self.label_smoothing = label_smoothing
+        self.weight_clamp    = weight_clamp
         self.register_buffer("weight", weight)
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -161,10 +190,16 @@ class SoftmaxFocalLoss(nn.Module):
         else:
             targets_idx = targets.long()
 
+        weight = (
+            torch.clamp(self.weight, max=self.weight_clamp)
+            if (self.weight is not None and self.weight_clamp > 0)
+            else self.weight
+        )
+
         # Per-sample CE loss (no reduction yet)
         ce = F.cross_entropy(
             logits, targets_idx,
-            weight=self.weight,
+            weight=weight,
             label_smoothing=self.label_smoothing,
             reduction="none",
         )
@@ -319,10 +354,12 @@ class LogitAdjustmentLoss(nn.Module):
         class_freq:      torch.Tensor,
         tau:             float = 1.0,
         label_smoothing: float = 0.0,
+        loss_clamp:      float = 0.0,
     ):
         super().__init__()
         self.tau             = tau
         self.label_smoothing = label_smoothing
+        self.loss_clamp      = loss_clamp
         # log(π_k): shape (C,) — registered as buffer so .to(device) works
         self.register_buffer("log_prior", torch.log(class_freq.clamp(min=1e-9)))
 
@@ -334,15 +371,19 @@ class LogitAdjustmentLoss(nn.Module):
         if targets.dim() == 2:
             targets = targets.argmax(dim=1)   # [B,]
 
-        # Adjust logits: z_k - τ·log(π_k)
+        # Adjust logits: z_k + τ·log(π_k)
         # log_prior is negative for rare classes → subtracting negative = adding positive
         # → rare classes get boosted logit → easier to predict
         adjusted = logits + self.tau * self.log_prior   # broadcast (C,) over batch
 
-        return F.cross_entropy(
+        loss = F.cross_entropy(
             adjusted, targets,
             label_smoothing=self.label_smoothing,
+            reduction="none" if self.loss_clamp > 0 else "mean",
         )
+        if self.loss_clamp > 0:
+            loss = loss.clamp(max=self.loss_clamp).mean()
+        return loss
 
 
 # ── 7. LDAM Loss ─────────────────────────────────────────────────────────────
@@ -386,10 +427,12 @@ class LDAMLoss(nn.Module):
         C:               float = 0.5,
         class_weight:    Optional[torch.Tensor] = None,
         label_smoothing: float = 0.0,
+        weight_clamp:    float = 0.0,
     ):
         super().__init__()
         self.label_smoothing = label_smoothing
-        self.C = C
+        self.C            = C
+        self.weight_clamp = weight_clamp
 
         # Δ_k = C / n_k^(1/4) — larger margin for minority classes
         margins = C / (class_counts.float().clamp(min=1) ** 0.25)
@@ -426,9 +469,14 @@ class LDAMLoss(nn.Module):
         # Adjusted logits: penalise GT class → harder to be confident → larger margin
         adjusted = logits - margin_mask                                 # [B, C]
 
+        class_weight = (
+            torch.clamp(self.class_weight, max=self.weight_clamp)
+            if self.weight_clamp > 0
+            else self.class_weight
+        )
         return F.cross_entropy(
             adjusted, targets,
-            weight=self.class_weight,
+            weight=class_weight,
             label_smoothing=self.label_smoothing,
         )
 
@@ -455,8 +503,11 @@ def get_loss(
     """
     loss_name = loss_name.lower()
 
+    weight_clamp = kwargs.get("weight_clamp", 0.0)
+
     if loss_name in ("bce", "bce_with_logits"):
-        return WeightedBCEWithLogitsLoss(pos_weight=pos_weight)
+        return WeightedBCEWithLogitsLoss(pos_weight=pos_weight,
+                                         weight_clamp=weight_clamp)
 
     elif loss_name == "focal":
         alpha = kwargs.get("focal_alpha", 0.25)
@@ -465,14 +516,17 @@ def get_loss(
 
     elif loss_name in ("softmax_ce", "ce", "cross_entropy"):
         label_smoothing = kwargs.get("label_smoothing", 0.0)
+        loss_clamp      = kwargs.get("loss_clamp", 0.0)
         return SoftmaxCrossEntropyLoss(label_smoothing=label_smoothing,
-                                       weight=class_weight)
+                                       weight=class_weight,
+                                       loss_clamp=loss_clamp,
+                                       weight_clamp=weight_clamp)
 
     elif loss_name in ("focal_softmax", "softmax_focal", "ce_focal"):
         gamma           = kwargs.get("focal_gamma", 2.0)
         label_smoothing = kwargs.get("label_smoothing", 0.0)
         return SoftmaxFocalLoss(gamma=gamma, label_smoothing=label_smoothing,
-                                weight=class_weight)
+                                weight=class_weight, weight_clamp=weight_clamp)
 
     elif loss_name in ("asl", "asymmetric"):
         gamma_neg = kwargs.get("asl_gamma_neg", 4.0)
@@ -485,10 +539,12 @@ def get_loss(
             "logit_adjustment requires class_freq — computed via compute_class_freq(labels_np)"
         tau             = kwargs.get("la_tau", 1.0)
         label_smoothing = kwargs.get("label_smoothing", 0.0)
+        loss_clamp      = kwargs.get("loss_clamp", 0.0)
         return LogitAdjustmentLoss(
             class_freq=class_freq,
             tau=tau,
             label_smoothing=label_smoothing,
+            loss_clamp=loss_clamp,
         )
 
     elif loss_name in ("ldam", "ldam_drw"):
@@ -501,6 +557,7 @@ def get_loss(
             C=C,
             class_weight=class_weight,   # None in stage 1, weighted in stage 2 (DRW)
             label_smoothing=label_smoothing,
+            weight_clamp=weight_clamp,
         )
 
     else:
