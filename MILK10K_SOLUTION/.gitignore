@@ -2,7 +2,9 @@
 *.pth
 *.pt
 *.ckpt
-outputs/checkpoints/
+
+# Outputs (logs, submissions, artifacts — không push lên git)
+outputs/
 
 # Dataset (large files — download separately)
 datasets/
